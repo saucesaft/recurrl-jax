@@ -25,7 +25,8 @@ from pathlib import Path
 
 import recurrl_jax as rjx
 import recurrl_jax.utils.wrappers as rjxw
-import recurrl_jax.leap_hand.env_wrapper as rjx_leap
+
+import examples.leap_hand.env_wrapper as rjx_leap
 
 from recurrl_jax.model_fns import flatten_repr_model
 
