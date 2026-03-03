@@ -19,7 +19,7 @@ def jax_pad(input, pad, mode='constant', value=0):
       padding_value=jnp.array(value, input.dtype))
 
 def tree_dot(a,b):
-    prod=jax.tree_multimap(lambda x, y: jnp.tensordot(x,y,axes=y.ndim), a, b)
+    prod=jax.tree.map(lambda x, y: jnp.tensordot(x,y,axes=y.ndim), a, b)
     sum_tree=jnp.stack(jax.tree_util.tree_flatten(prod)[0],axis=0).sum(axis=0)
     return sum_tree
 
@@ -31,7 +31,7 @@ def tree_scalar_multiply(a,scalar):
     return jax.tree.map(lambda x:x*scalar,a)
 
 def tree_subtract(a,b):
-    return jax.tree_multimap(lambda x,y: x-y,a,b)
+    return jax.tree.map(lambda x,y: x-y,a,b)
 
 
 def tree_index(tree,i):
