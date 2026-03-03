@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Development artifacts
+DR.txt
+examples/leap_hand/test_angvel_frame.py
+examples/leap_hand/TODO.txt
+
+# Training outputs
+examples/leap_hand/checkpoints/
+examples/leap_hand/outputs/
+examples/leap_hand/videos/
+examples/leap_hand/cache/
+
+# Logs
+*.log
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# JAX / XLA cache
+.jax_cache/
+/tmp/

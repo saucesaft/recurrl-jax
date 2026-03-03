@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "recurrl-jax"
+version: 0.1.0
+date-released: 2025-02-01
+url: "https://github.com/YOUR_USERNAME/recurrl-jax"
+abstract: >
+  A JAX-based recurrent reinforcement learning library supporting LSTM, GRU,
+  and GTrXL sequence models with PPO and A2C. Designed for dexterous
+  manipulation tasks with MuJoCo/MJX environments and asymmetric actor-critic
+  training.
+authors:
+  - family-names: "Hernandez Valdez"
+    given-names: "Eduardo"
+keywords:
+  - reinforcement learning
+  - JAX
+  - recurrent neural networks
+  - robotics
+  - MuJoCo
+  - dexterous manipulation
+license: MIT

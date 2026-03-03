@@ -1,0 +1,40 @@
+[project]
+name = "recurrl-jax"
+version = "0.1.0"
+description = "JAX-based recurrent reinforcement learning library with RNN/GRU/Transformer support"
+readme = "README.md"
+requires-python = "==3.12"
+dependencies = [
+    "hydra-core>=1.1",
+    "omegaconf>=2.3.0",
+    "brax>=0.13.0",
+    "jax[cuda12]>=0.7.2",
+    "matplotlib>=3.10.6",
+    "mediapy>=1.2.4",
+    "mujoco>=3.3.6",
+    "mujoco-mjx[warp]>=3.3.6",
+    "notebook>=7.4.5",
+    "tqdm>=4.67.1",
+    "chex>=0.1.91",
+    "optax>=0.2.6",
+    "distrax>=0.1.7",
+    "tensorboardx>=2.6.4",
+    "imageio[ffmpeg]>=2.37.0",
+    "tensorboard>=2.20.0",
+    "playground>=0.0.5",
+    "wandb>=0.23.0",
+    "pandas>=2.3.3",
+    "rlax>=0.1.8",
+    "gymnasium==0.29.0",
+    "orbax-checkpoint>=0.5.0",
+]
+
+[project.scripts]
+leap-hand-train = "examples.leap_hand.train:main"
+
+[tool.setuptools.packages.find]
+include = ["recurrl_jax*", "examples*"]
+
+[[tool.uv.index]]
+name = "jax-cuda"
+url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"

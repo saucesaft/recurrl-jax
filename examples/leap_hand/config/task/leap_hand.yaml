@@ -1,0 +1,5 @@
+task: leap_hand
+use_domain_randomization: true
+num_envs: 8192  # RTX 4080 16GB - can handle 8192 comfortably
+action_scale: 0.6  # Absolute control scale (matches mujoco_playground)
+grasp_cache_path: "cache/grasp_cache_v3.npy"

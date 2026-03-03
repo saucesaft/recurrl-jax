@@ -1,0 +1,4 @@
+name: gru
+d_model: 256
+n_layers: 1
+reset_hidden_on_terminate: true

@@ -1,0 +1,25 @@
+tags: null
+project_name: "rotatez"
+seed: 42
+steps: 100000000
+log_interval: 10000000
+eval_episodes: 10
+eval_interval: 10000000
+use_wandb: false
+
+# Checkpointing
+checkpoint_dir: "checkpoints"
+save_best_only: true
+
+# Video rendering
+video_dir: "videos"
+render_videos: true
+video_length: 500
+video_fps: 30
+video_width: 640
+video_height: 480
+
+defaults:
+  - _self_
+  - task: leap_hand
+  - /trainer: ppo
