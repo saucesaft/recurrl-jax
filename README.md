@@ -9,7 +9,7 @@ A JAX-based recurrent reinforcement learning library. Supports LSTM, GRU, and GT
 
 ## features
 
-- **sequence models**: multi-layer LSTM, GRU, and GTrXL with correct episode boundary resets
+- **sequence models**: multi-layer LSTM, GRU, and GTrXL (experimental) with correct episode boundary resets
 - **agents**: PPO (with adaptive LR, minibatch BPTT) and A2C
 - **asymmetric actor-critic**: policy obs and privileged obs split at the model level
 - **domain randomization**: per-environment batched MJX model randomization
