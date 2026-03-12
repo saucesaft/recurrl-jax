@@ -40,6 +40,10 @@ recurrl_jax/
 └── utils/           # wrappers, logging, video, quat math, running stats
 ```
 
+## background
+
+recurrl-jax was originally developed during an internship at [JRL Lab](https://jrl.cnrs.fr) (CNRS-AIST JRL, UMI3218/RL), where it was used for dexterous manipulation research with the LEAP hand.
+
 ## acknowledgments
 
 - [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) — Google DeepMind. The LEAP hand mesh assets and XML scene descriptions are sourced from this repository.
