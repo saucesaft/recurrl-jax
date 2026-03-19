@@ -39,7 +39,7 @@ class Trainer(BaseTrainer):
     def __init__(self, *, env_factory, eval_env_factory=None, repr_fn=None,
                  is_continuous=None, video_render_fn=None, **kwargs):
 
-        self.wandb_run=kwargs['wandb_run']
+        self.wandb_run=kwargs['wandb_run'] # TODO generalize logging
         self.trainer_config=kwargs['trainer_config']
         self.env_config=kwargs.get('env_config', {})
         self.global_config=kwargs['global_args']
