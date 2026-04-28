@@ -19,7 +19,7 @@ from recurrl_jax.agents.base_agent import BaseAgent
 
 class PPOAgent(BaseAgent):
 
-    def __init__(self,train_envs,eval_env,repr_model_fn:Callable,seq_model_fn:Tuple[Callable,Callable],
+    def __init__(self, train_envs,eval_env, repr_model_fn:Callable,seq_model_fn:Tuple[Callable,Callable],
                         actor_fn:Callable,critic_fn:Callable,optimizer:optax.GradientTransformation,
                          num_steps=128, gamma=0.99, lr_schedule=optax.linear_schedule,
                         gae_lambda=0.95, num_minibatches=4, update_epochs=4, norm_adv=True,
@@ -64,18 +64,28 @@ class PPOAgent(BaseAgent):
             data_batch,update_tick
         ):
 
+            # GAE's lambda
             Glambda_fn=jax.vmap(rlax.lambda_returns)
+
             observations,actions,rewards,terminations,true_terminations,critic_preds,actor_preds=data_batch['observations'],data_batch['actions'], \
                                             data_batch['rewards'],data_batch['terminations'],data_batch['true_terminations'],data_batch['critic_preds'],data_batch['actor_preds']
             # use true terminations only for gamma (not combined done flag)
             gammas=self.gamma*(1-true_terminations)
             lambdas=self.gae_lambda*jnp.ones(self.num_envs)
-            #calculate lambda returns for timesteps G_{tick} - G_{tick+rollout_len}
-            #rewards, gammas, lambdas values at timesteps {tick+1} - {tick+rollout_len+1}
-            Glambdas=Glambda_fn(rewards[:,1:],gammas[:,1:],
-                              critic_preds[:,1:],lambdas)
-            #calculate the advantages using timesteps {tick} - {tick+rollout_len}
-            advantages=Glambdas-critic_preds[:,:-1]
+
+            # calculate lambda returns (target returns) for timesteps G_{tick} - G_{tick+rollout_len}
+
+            # rewards, gammas, lambdas values at timesteps {tick+1} - {tick+rollout_len+1}
+            Glambdas = Glambda_fn(rewards[:,1:], gammas[:,1:], critic_preds[:,1:],lambdas)
+            
+            # calculate the advantages using timesteps {tick} - {tick+rollout_len}
+            
+            # td error
+            #\delta_t = r_t + \gamma V( S_{t + 1} ) - V( S_{t} )
+
+            # advantage function
+            # A_t = G_{t}^{\lambda} - V(s_t)
+            advantages = Glambdas - critic_preds[:,:-1]
 
             if self.is_continuous:
                 mean, log_std = actor_preds
