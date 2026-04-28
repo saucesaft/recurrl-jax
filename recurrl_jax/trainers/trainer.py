@@ -141,6 +141,7 @@ class Trainer(BaseTrainer):
         critic_fn=critic_model(self.trainer_config['d_critic'])
         #setup optimizer
 
+        # TODO test functionality
         if self.trainer_config['agent']=='a2c':
             self.optimizer=optax.chain(optax.clip_by_global_norm(self.trainer_config['max_grad_norm']),
                                     optax.adam(**self.trainer_config.optimizer))
@@ -200,6 +201,7 @@ class Trainer(BaseTrainer):
                 lr_min = adaptive_lr_config.get('lr_min', 1e-6)
                 lr_max = adaptive_lr_config.get('lr_max', 1e-2)
 
+            # TODO prettier way to pass parameters?
             self.agent=PPOAgent(train_envs=train_envs,eval_env=eval_env,optimizer=self.optimizer, repr_model_fn=repr_fn,
                                 seq_model_fn=model_fn,actor_fn=actor_fn,critic_fn=critic_fn,
                                 num_steps=self.rollout_len,
