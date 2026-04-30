@@ -7,7 +7,8 @@ import imageio
 import mujoco
 
 from examples.leap_hand.observation_buffer import build_asymmetric_observation
-from examples.leap_hand.env import env_step_jit
+from examples.leap_hand.env import _leap_reward_fn, _leap_termination_fn, _leap_reset_state_fn
+from recurrl_jax.utils.mjx_env import mjx_training_step
 from recurrl_jax.utils.running_mean_std import normalize_jit
 
 
@@ -52,6 +53,9 @@ def render_policy_video_asymmetric(
 
     # initial DOF positions for pose diff penalty (from grasp cache)
     single_initial_dof_pos = env.initial_dof_pos[0:1]
+    single_angvel_z_smooth = env.angvel_z_smooth[0:1]
+    action_ema_alpha = getattr(config, 'action_ema_alpha', 0.0)
+    single_smoothed_actions = None
 
     # convert mjx_data to mujoco data for rendering
     mj_data = mujoco.MjData(mj_model)
@@ -114,19 +118,38 @@ def render_policy_video_asymmetric(
         mu, _, _ = model(obs_normalized)
         action = mu
 
+        # apply action EMA smoothing
+        if action_ema_alpha > 0.0:
+            if single_smoothed_actions is None:
+                single_smoothed_actions = action
+            single_smoothed_actions = action_ema_alpha * single_smoothed_actions + (1.0 - action_ema_alpha) * action
+            stepped_action = single_smoothed_actions
+        else:
+            stepped_action = action
+
         # step environment
         key, step_key = jr.split(key)
-        raw_state, reward, done, termination, info, single_mjx_data, single_progress_buf, single_mjx_model, _ = env_step_jit(
-            actions=action,
-            mjx_model=single_mjx_model,
-            mjx_data_batch=single_mjx_data,
-            progress_buf=single_progress_buf,
-            initial_dof_pos=single_initial_dof_pos,
-            reset_height_threshold=env.reset_height_threshold,
-            max_episode_length=config.episode_length,
-            key=step_key,
+        raw_state, reward, done, termination, info, single_mjx_data, single_progress_buf, single_mjx_model, single_angvel_z_smooth = mjx_training_step(
+            stepped_action,
+            single_mjx_model,
+            single_mjx_data,
+            single_progress_buf,
+            single_initial_dof_pos,
+            env.reset_height_threshold,
+            config.episode_length,
+            step_key,
+            single_angvel_z_smooth,
+            spec=env.spec,
+            reward_fn=_leap_reward_fn,
+            termination_fn=_leap_termination_fn,
+            reset_state_fn=_leap_reset_state_fn,
             control_freq_inv=config.control_freq_inv,
+            use_domain_randomization=env.use_domain_randomization,
+            dr_params=env.dr_params,
+            base_mjx=env.base_mjx,
             action_scale=config.action_scale,
+            grasp_cache=env.grasp_cache,
+            grasp_cache_size=env.grasp_cache_size,
         )
 
         # render frame

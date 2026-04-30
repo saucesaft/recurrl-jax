@@ -47,6 +47,7 @@ def make_env(env_config, trainer_config, global_config):
         use_domain_randomization=env_config.get('use_domain_randomization', True),
         normalize_obs=True,
         action_scale=env_config.get('action_scale', 0.6),
+        action_ema_alpha=env_config.get('action_ema_alpha', 0.0),
         grasp_cache_path=env_config.get('grasp_cache_path', None),
         update_norm_stats=True,
     )
@@ -66,6 +67,7 @@ def make_eval_env(env_config, trainer_config, global_config, train_envs):
         use_domain_randomization=False,  # no DR for eval
         normalize_obs=True,
         action_scale=env_config.get('action_scale', 0.6),
+        action_ema_alpha=env_config.get('action_ema_alpha', 0.0),
         grasp_cache_path=env_config.get('grasp_cache_path', None),
         shared_running_mean_std=shared_rms,
         update_norm_stats=False,  # don't update stats during eval
@@ -171,10 +173,23 @@ def main(config: DictConfig):
     pbar = tqdm(total=config.steps)
     step_count = 0
     last_step_count = 0
+    _profile_done = False
 
     with logging_redirect_tqdm():
         while True:
-            loss, metrics, step_count = trainer.step()
+
+            if step_count > 0 and not _profile_done:
+                
+                with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
+
+                    loss, metrics, step_count = trainer.step()
+
+                    jax.effects_barrier() # flush async dispatch before trace closes
+
+                _profile_done = True
+            else:
+                loss, metrics, step_count = trainer.step()
+
             pbar.update(n=step_count - last_step_count)
             last_step_count = step_count
 

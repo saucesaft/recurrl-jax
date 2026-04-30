@@ -1,13 +1,13 @@
 agent: ppo
-d_actor: 512
-d_critic: 512
+d_actor: 256
+d_critic: 256
 num_envs: 8
 rollout_len: 32
 sequence_length: 8
 gamma: 0.99
 gae_lambda: 0.97
 num_minibatches: 8
-update_epochs: 4
+update_epochs: 6
 norm_adv: true
 
 clip_coef: 0.2

@@ -13,11 +13,13 @@ class LeapHandGymWrapper(MJXGymWrapper):
         num_envs: int = 1,
         use_domain_randomization: bool = False,
         action_scale: float = 0.6,
+        action_ema_alpha: float = 0.0,
         grasp_cache_path: str = None,
         **kwargs,
     ):
         self._use_dr = use_domain_randomization
         self._action_scale = action_scale
+        self._action_ema_alpha = action_ema_alpha
         self._grasp_cache_path = grasp_cache_path
         super().__init__(obs_dim=105, action_dim=16, num_envs=num_envs, policy_obs_dim=32, **kwargs)
 
@@ -27,6 +29,7 @@ class LeapHandGymWrapper(MJXGymWrapper):
             num_envs=self.num_envs,
             key=key,
             action_scale=self._action_scale,
+            action_ema_alpha=self._action_ema_alpha,
             use_domain_randomization=self._use_dr,
             grasp_cache_path=self._grasp_cache_path,
         )
