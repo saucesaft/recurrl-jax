@@ -137,6 +137,8 @@ class Trainer(BaseTrainer):
             model_fn=seq_model_gru(**self.trainer_config['seq_model'])
         elif self.trainer_config.seq_model.name=='gtrxl':
             model_fn=seq_model_gtrxl(**self.trainer_config['seq_model'])
+        elif self.trainer_config.seq_model.name=='mlp':
+            model_fn=seq_model_mlp(**self.trainer_config['seq_model'])
 
         critic_fn=critic_model(self.trainer_config['d_critic'])
         #setup optimizer

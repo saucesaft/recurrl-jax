@@ -1,0 +1,13 @@
+seed: 42
+steps: 100_000
+log_interval: 10_000
+eval_episodes: 5
+eval_interval: 50_000
+use_wandb: false
+
+checkpoint_dir: checkpoints
+
+defaults:
+  - _self_
+  - task: pendulum
+  - /trainer: ppo

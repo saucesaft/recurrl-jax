@@ -1,5 +1,6 @@
 from recurrl_jax.models.rnns.rnn import LSTMMultiLayer, GRUMultiLayer
 from recurrl_jax.models.transformers.gtrxl import GTrXL
+from recurrl_jax.models.mlp_seq import MLPSeq
 
 
 # lstm fn factory
@@ -34,5 +35,15 @@ def seq_model_gtrxl(**kwargs):
 
     def initialize():
         return GTrXL.initialize_state(memory_len=kwargs['memory_len'], embedding_dim=kwargs['embedding_dim'], layer_num=kwargs['layer_num'])
+
+    return thurn, initialize
+
+# mlp fn factory (no recurrence; memory is a dummy scalar)
+def seq_model_mlp(**kwargs):
+    def thurn():
+        return MLPSeq(d_model=kwargs['d_model'], n_layers=kwargs['n_layers'])
+
+    def initialize():
+        return MLPSeq.initialize_state()
 
     return thurn, initialize

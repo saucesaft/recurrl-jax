@@ -1,0 +1,32 @@
+agent: ppo
+d_actor: 64
+d_critic: 128
+num_envs: 32
+rollout_len: 32
+sequence_length: null
+gamma: 0.99
+gae_lambda: 0.95
+num_minibatches: 2
+update_epochs: 20
+norm_adv: true
+
+clip_coef: 0.2
+
+log_std_min: -3.0
+log_std_max: 0.0
+
+ent_coef:
+  initial: 0.0
+  final: 0.0
+  max_decay_steps: 500000
+  power: 1
+
+vf_coef: 1.0
+max_grad_norm: 0.5
+
+adaptive_lr:
+  enabled: false
+
+defaults:
+  - _self_
+  - seq_model: mlp
