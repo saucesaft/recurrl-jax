@@ -1,0 +1,6 @@
+task: leap_hand
+use_domain_randomization: true
+num_envs: 8192
+action_scale: 0.6  # Absolute control scale (matches mujoco_playground)
+action_ema_alpha: 0.6  # EMA smoothing for actions (0=no smoothing, higher=more lag)
+grasp_cache_path: "cache/grasp_cache_v3.npy"

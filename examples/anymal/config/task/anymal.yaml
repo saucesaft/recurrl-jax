@@ -1,0 +1,9 @@
+task: anymal
+use_domain_randomization: true
+num_envs: 1024
+action_scale: 0.5
+env_variant: anymal
+cmd_scale: 1.0
+cmd_min_speed: 0.0
+cmd_scale_curriculum_steps: 20000000
+curriculum_ep_len_threshold: 100
