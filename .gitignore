@@ -20,10 +20,10 @@ examples/leap_hand/test_angvel_frame.py
 examples/leap_hand/TODO.txt
 
 # Training outputs
-examples/leap_hand/checkpoints/
-examples/leap_hand/outputs/
-examples/leap_hand/videos/
-examples/leap_hand/cache/
+**/checkpoints/
+**/outputs/
+**/videos/
+**/cache/
 
 # Logs
 *.log
