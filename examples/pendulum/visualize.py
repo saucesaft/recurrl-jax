@@ -18,9 +18,9 @@ from recurrl_jax.model_fns.seq_fns import seq_model_mlp
 from recurrl_jax.model_fns.achead_fns import actor_model_continuous, critic_model
 
 
-def build_model(d_actor=64, d_critic=128, d_model=64, n_layers=2, action_dim=1):
+def build_model(d_actor=64, d_critic=128, dims=(64, 64), action_dim=1):
     repr_fn = flatten_repr_model()
-    seq_fn, seq_init = seq_model_mlp(name="mlp", d_model=d_model, n_layers=n_layers)
+    seq_fn, seq_init = seq_model_mlp(name="mlp", dims=list(dims))
     actor_fn = actor_model_continuous(d_actor, action_dim)
     critic_fn = critic_model(d_critic)
 
@@ -54,10 +54,9 @@ def load_params(checkpoint_dir: str, seq_init, num_envs=1):
 
 
 def run(checkpoint_dir="checkpoints", episodes=3, save_gif=None,
-        d_actor=64, d_critic=128, d_model=64, n_layers=2, fps=30):
+        d_actor=64, d_critic=128, dims=(64, 64), fps=30):
 
-    ac, seq_init = build_model(d_actor=d_actor, d_critic=d_critic,
-                               d_model=d_model, n_layers=n_layers)
+    ac, seq_init = build_model(d_actor=d_actor, d_critic=d_critic, dims=dims)
     params, h0 = load_params(checkpoint_dir, seq_init)
 
     # no render_mode — we drive the viewer ourselves

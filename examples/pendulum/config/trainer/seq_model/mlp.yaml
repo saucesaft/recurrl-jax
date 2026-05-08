@@ -1,3 +1,2 @@
 name: mlp
-d_model: 64
-n_layers: 2
+dims: [64, 64]
