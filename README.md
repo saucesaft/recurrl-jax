@@ -9,18 +9,38 @@ A JAX-based recurrent reinforcement learning library. Supports LSTM, GRU, and GT
 
 ## features
 
-- **sequence models**: multi-layer LSTM, GRU, and GTrXL (experimental) with correct episode boundary resets
+- **sequence models**: MLP (non-recurrent), multi-layer LSTM, GRU, and GTrXL (experimental) with correct episode boundary resets
 - **agents**: PPO (with adaptive LR, minibatch BPTT) and A2C
 - **asymmetric actor-critic**: policy obs and privileged obs split at the model level
 - **domain randomization**: per-environment batched MJX model randomization
 - **training**: configurable via Hydra, Orbax checkpointing, and video recording
 
-## example: LEAP hand reorientation
+## examples
+
+### LEAP hand reorientation
 
 Dexterous in-hand reorientation with a 16-DOF LEAP hand in MJX.
 
 ```bash
 cd examples/leap_hand
+uv run python train.py
+```
+
+### ANYmal locomotion
+
+Quadrupedal locomotion for the ANYmal C robot.
+
+```bash
+cd examples/anymal
+uv run python train.py
+```
+
+### pendulum
+
+Classic swing-up task.
+
+```bash
+cd examples/pendulum
 uv run python train.py
 ```
 
