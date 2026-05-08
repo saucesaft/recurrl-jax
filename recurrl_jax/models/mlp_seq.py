@@ -6,15 +6,14 @@ from flax.linen.initializers import constant, orthogonal
 
 class MLPSeq(nn.Module):
     """MLP drop-in for the seq_model slot. no recurrent state; memory is a dummy scalar."""
-    d_model: int
-    n_layers: int
+    dims: tuple  # e.g. (512, 256, 128); output dim = dims[-1]
 
     @nn.compact
     def __call__(self, inputs, terminations, last_memory):
         x = inputs
-        for _ in range(self.n_layers):
+        for d in self.dims:
             x = nn.Dense(
-                self.d_model,
+                d,
                 kernel_init=orthogonal(jnp.sqrt(2)),
                 bias_init=constant(0.0),
             )(x)

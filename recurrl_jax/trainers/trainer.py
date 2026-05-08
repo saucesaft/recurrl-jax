@@ -402,6 +402,18 @@ class Trainer(BaseTrainer):
                     'best_eval_return': float(self.best_eval_return),
                 }
 
+                # save obs normalisation stats if available
+                rms_env = getattr(self.agent, 'eval_env', None)
+                if rms_env is None:
+                    rms_env = getattr(self.agent, 'train_envs', None)
+                # unwrap one level (SqueezeWrapper / VectorEpisodeStatisticsWrapper)
+                if rms_env is not None and not hasattr(rms_env, 'running_mean_std'):
+                    rms_env = getattr(rms_env, 'env', rms_env)
+                rms = getattr(rms_env, 'running_mean_std', None)
+                if rms is not None:
+                    checkpoint_state['obs_mean'] = np.array(rms.mean)
+                    checkpoint_state['obs_var'] = np.array(rms.var)
+
                 self.checkpoint_manager.save(self.step_count, checkpoint_state)
                 logger.info(f"Saved best checkpoint at step {self.step_count} "
                             f"with eval return {self.best_eval_return:.2f}")

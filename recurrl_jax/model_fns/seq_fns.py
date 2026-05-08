@@ -40,8 +40,10 @@ def seq_model_gtrxl(**kwargs):
 
 # mlp fn factory (no recurrence; memory is a dummy scalar)
 def seq_model_mlp(**kwargs):
+    dims = tuple(kwargs['dims'])
+
     def thurn():
-        return MLPSeq(d_model=kwargs['d_model'], n_layers=kwargs['n_layers'])
+        return MLPSeq(dims=dims)
 
     def initialize():
         return MLPSeq.initialize_state()
