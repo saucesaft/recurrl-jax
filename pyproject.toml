@@ -1,6 +1,6 @@
 [project]
 name = "recurrl-jax"
-version = "0.1.0"
+version = "0.2.0a1"
 description = "JAX-based recurrent reinforcement learning library with RNN/GRU/Transformer support"
 readme = "README.md"
 requires-python = "==3.12"
@@ -38,3 +38,8 @@ include = ["recurrl_jax*", "examples*"]
 [[tool.uv.index]]
 name = "jax-cuda"
 url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html"
+
+[dependency-groups]
+dev = [
+    "pygame>=2.6.1",
+]
