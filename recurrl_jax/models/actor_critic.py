@@ -27,7 +27,6 @@ class ActorCriticModel(nn.Module):
             privileged_obs = inputs[..., self.policy_obs_dim:]
 
             rep = self.repr_model(policy_obs)
-            rep = rep.reshape(rep.shape[0], -1)
             seq_rep, memory = self.seq_model(rep, terminations, last_memory)
 
             # actor uses recurrent features only
@@ -39,7 +38,6 @@ class ActorCriticModel(nn.Module):
         else:
             # symmetric: same obs for both actor and critic
             rep = self.repr_model(inputs)
-            rep = rep.reshape(rep.shape[0], -1)
             seq_rep, memory = self.seq_model(rep, terminations, last_memory)
             actor_out = self.actor(seq_rep)
             critic_out = self.critic(seq_rep)

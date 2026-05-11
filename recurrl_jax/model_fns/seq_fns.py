@@ -1,6 +1,7 @@
 from recurrl_jax.models.rnns.rnn import LSTMMultiLayer, GRUMultiLayer
 from recurrl_jax.models.transformers.gtrxl import GTrXL
 from recurrl_jax.models.mlp_seq import MLPSeq
+from recurrl_jax.models.identity_seq import IdentitySeq
 
 
 # lstm fn factory
@@ -35,6 +36,16 @@ def seq_model_gtrxl(**kwargs):
 
     def initialize():
         return GTrXL.initialize_state(memory_len=kwargs['memory_len'], embedding_dim=kwargs['embedding_dim'], layer_num=kwargs['layer_num'])
+
+    return thurn, initialize
+
+# identity fn factory (no-op; memory is a dummy scalar)
+def seq_model_identity():
+    def thurn():
+        return IdentitySeq()
+
+    def initialize():
+        return IdentitySeq.initialize_state()
 
     return thurn, initialize
 

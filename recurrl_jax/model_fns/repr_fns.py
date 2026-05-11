@@ -5,9 +5,18 @@ from flax.linen.initializers import constant, orthogonal
 
 class Flatten(nn.Module):
     def __call__(self, x):
-        return x.reshape(x.shape[0], -1)
+        return x.reshape(*x.shape[:-1], -1)
 
 def flatten_repr_model():
     def thurn():
         return Flatten()
+    return thurn
+
+class IdentityRepr(nn.Module):
+    def __call__(self, x):
+        return x
+
+def identity_repr_model():
+    def thurn():
+        return IdentityRepr()
     return thurn
