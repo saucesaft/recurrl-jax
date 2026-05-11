@@ -37,6 +37,7 @@ class Trainer(BaseTrainer):
     """generalized trainer using env_factory pattern"""
 
     def __init__(self, *, env_factory, eval_env_factory=None, repr_fn=None,
+                 actor_fn=None, seq_model_fn=None,
                  is_continuous=None, video_render_fn=None, **kwargs):
 
         self.wandb_run=kwargs['wandb_run'] # TODO generalize logging
@@ -113,16 +114,17 @@ class Trainer(BaseTrainer):
                 train_envs.action_space, gym.spaces.Box
             )
 
-        if is_continuous:
-            action_dim = train_envs.action_space.shape[0]
-            actor_fn = actor_model_continuous(
-                self.trainer_config['d_actor'], action_dim,
-                log_std_min=self.trainer_config.get('log_std_min', -5.0),
-                log_std_max=self.trainer_config.get('log_std_max', 2.0)
-            )
-        else:
-            action_dim = train_envs.action_space.n
-            actor_fn = actor_model_discete(self.trainer_config['d_actor'], action_dim)
+        if actor_fn is None:
+            if is_continuous:
+                action_dim = train_envs.action_space.shape[0]
+                actor_fn = actor_model_continuous(
+                    self.trainer_config['d_actor'], action_dim,
+                    log_std_min=self.trainer_config.get('log_std_min', -5.0),
+                    log_std_max=self.trainer_config.get('log_std_max', 2.0)
+                )
+            else:
+                action_dim = train_envs.action_space.n
+                actor_fn = actor_model_discete(self.trainer_config['d_actor'], action_dim)
 
         logger.info("Observation space: "+str(train_envs.observation_space))
         logger.info("Action space: "+str(train_envs.action_space))
@@ -131,7 +133,9 @@ class Trainer(BaseTrainer):
         if repr_fn is None:
             repr_fn = flatten_repr_model()
 
-        if self.trainer_config.seq_model.name=='lstm':
+        if seq_model_fn is not None:
+            model_fn = seq_model_fn
+        elif self.trainer_config.seq_model.name=='lstm':
             model_fn=seq_model_lstm(**self.trainer_config['seq_model'])
         elif self.trainer_config.seq_model.name=='gru':
             model_fn=seq_model_gru(**self.trainer_config['seq_model'])
@@ -139,6 +143,8 @@ class Trainer(BaseTrainer):
             model_fn=seq_model_gtrxl(**self.trainer_config['seq_model'])
         elif self.trainer_config.seq_model.name=='mlp':
             model_fn=seq_model_mlp(**self.trainer_config['seq_model'])
+        else:
+            raise ValueError(f"Unknown seq_model '{self.trainer_config.seq_model.name}' and no seq_model_fn passed.")
 
         critic_fn=critic_model(self.trainer_config['d_critic'])
         #setup optimizer
