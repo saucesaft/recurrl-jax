@@ -1,6 +1,6 @@
 [project]
 name = "recurrl-jax"
-version = "0.2.0a1"
+version = "0.2.0a2"
 description = "JAX-based recurrent reinforcement learning library with RNN/GRU/Transformer support"
 readme = "README.md"
 requires-python = "==3.12"
