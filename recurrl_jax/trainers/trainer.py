@@ -37,7 +37,7 @@ class Trainer(BaseTrainer):
     """generalized trainer using env_factory pattern"""
 
     def __init__(self, *, env_factory, eval_env_factory=None, repr_fn=None,
-                 actor_fn=None, seq_model_fn=None,
+                 actor_fn=None, seq_model_fn=None, use_asymmetric_obs=True,
                  is_continuous=None, video_render_fn=None, **kwargs):
 
         self.wandb_run=kwargs['wandb_run'] # TODO generalize logging
@@ -232,6 +232,7 @@ class Trainer(BaseTrainer):
                                 kl_threshold=kl_threshold,
                                 lr_min=lr_min,
                                 lr_max=lr_max,
+                                use_asymmetric_obs=use_asymmetric_obs,
                                 policy_obs_dim=policy_obs_dim)
 
 
@@ -395,6 +396,8 @@ class Trainer(BaseTrainer):
             metrics['step'] = self.step_count
             metrics['eval_avg_episode_len'] = float(avg_episode_len)
             metrics['eval_avg_episode_return'] = float(avg_episode_return)
+            if hasattr(self.agent, 'last_eval_success_rate'):
+                metrics['eval_success_rate'] = float(self.agent.last_eval_success_rate)
 
             # save checkpoint if best model
             if self.checkpoint_manager and avg_episode_return > self.best_eval_return:
