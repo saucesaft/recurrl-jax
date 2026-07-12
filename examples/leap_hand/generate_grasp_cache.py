@@ -109,7 +109,7 @@ def generate_grasp_cache(
     # initialize environment
     key, env_key = jr.split(key)
     env = MJXLeapHandEnv(
-        xml_path='leap_hand/xmls/scene_mjx_cube.xml',
+        xml_path='xmls/scene_mjx_cube.xml',
         num_envs=num_envs,
         key=env_key,
         action_scale=action_scale,

@@ -25,7 +25,7 @@ class LeapHandGymWrapper(MJXGymWrapper):
 
     def _make_env(self, key):
         return MJXLeapHandEnv(
-            xml_path='xmls/scene_mjx_cube.xml',
+            xml_path='examples/leap_hand/xmls/scene_mjx_cube.xml',
             num_envs=self.num_envs,
             key=key,
             action_scale=self._action_scale,
