@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recurrl-jax"
-version = "0.2.0a2"
+version = "0.2.0a3"
 description = "JAX-based recurrent reinforcement learning library with RNN/GRU/Transformer support"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -15,8 +15,8 @@ dependencies = [
     "flax>=0.10.0",
     "numpy>=1.26",
     "jax[cuda12]>=0.7.2",
-    "mujoco>=3.3.6",
-    "mujoco-mjx[warp]>=3.3.6",
+    "mujoco>=3.12.0",
+    "mujoco-mjx[warp]>=3.12.0",
     "tqdm>=4.67.1",
     "optax>=0.2.6",
     "distrax>=0.1.7",
