@@ -11,6 +11,7 @@ from recurrl_jax.models.actor_critic import *
 from typing import Callable
 from recurrl_jax.utils.recurrent_utils import tree_index
 from recurrl_jax.models.actor_critic import ActorCriticModel
+from recurrl_jax.utils.distributions import squashed_gaussian
 from argparse import Namespace
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,10 @@ class BaseAgent:
             if self.is_continuous:
                 mean, log_std = act_logits
                 std = jnp.exp(log_std)
-                dist = distrax.MultivariateNormalDiag(mean, std)
+                dist = squashed_gaussian(mean, std)
+                # sample is already tanh-squashed into (-1, 1); this is what
+                # gets executed AND what log_prob is later evaluated on, so
+                # there's no train/eval action mismatch and no need to clip.
                 acts_tick = dist.sample(seed=random_key).squeeze(axis=1)
             elif self.use_gumbel_sampling:
                 # sample action: Gumbel-softmax trick
@@ -213,7 +217,9 @@ class BaseAgent:
                 act_logits,_,h_tickminus1=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,1),term,h_tickminus1)
                 if self.is_continuous:
                     mean,_=act_logits
-                    acts_tick=jnp.clip(mean.squeeze(axis=1),-1.0,1.0)
+                    # deterministic action = tanh(mean), no clip needed:
+                    # tanh already bounds strictly within (-1, 1).
+                    acts_tick=jnp.tanh(mean.squeeze(axis=1))
                 else:
                     acts_tick=jnp.argmax(act_logits,axis=-1).squeeze(axis=1)
                 o_tick,r_tick,term_step,trunc_step,info=self.eval_env.step(acts_tick)

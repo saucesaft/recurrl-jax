@@ -55,9 +55,12 @@ class ActorContinuous(nn.Module):
         self.log_std = self.param('log_std', constant(self.initial_log_std), (self.action_dim,))
 
     def __call__(self, x):
-        # tanh bounds outputs to [-1, 1]
-        # TODO activate/deactivate bounds in config
-        mean = jnp.tanh(self.net(x))
+        # raw (pre-squash) mean of the base Normal. the actual executed action
+        # is tanh(mean + noise), built downstream via
+        # recurrl_jax.utils.distributions.squashed_gaussian, so the network's
+        # own tanh only ever bounds the *mean*, not the sample -- consistent
+        # bounding requires squashing after sampling, done at the call site.
+        mean = self.net(x)
 
         # clamp log_std
         log_std = jnp.clip( self.log_std, self.log_std_min, self.log_std_max )

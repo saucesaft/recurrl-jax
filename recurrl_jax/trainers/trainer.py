@@ -119,6 +119,7 @@ class Trainer(BaseTrainer):
                 action_dim = train_envs.action_space.shape[0]
                 actor_fn = actor_model_continuous(
                     self.trainer_config['d_actor'], action_dim,
+                    initial_log_std=self.trainer_config.get('initial_log_std', -0.5),
                     log_std_min=self.trainer_config.get('log_std_min', -5.0),
                     log_std_max=self.trainer_config.get('log_std_max', 2.0)
                 )

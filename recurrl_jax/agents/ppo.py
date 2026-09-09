@@ -14,6 +14,7 @@ from flax.training.train_state import TrainState
 from recurrl_jax.models.actor_critic import *
 from typing import Callable,Tuple
 from recurrl_jax.agents.base_agent import BaseAgent
+from recurrl_jax.utils.distributions import squashed_gaussian
 
 
 
@@ -94,7 +95,7 @@ class PPOAgent(BaseAgent):
                 # clip log_std
                 log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
                 std = jnp.exp(log_std)
-                dist = distrax.MultivariateNormalDiag(mean, std)
+                dist = squashed_gaussian(mean, std)
                 logprobs = dist.log_prob(actions)
             else:
                 B,T=actions.shape
@@ -112,9 +113,12 @@ class PPOAgent(BaseAgent):
                     # clip log_std
                     log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
                     std = jnp.exp(log_std)
-                    dist = distrax.MultivariateNormalDiag(mean, std)
+                    dist = squashed_gaussian(mean, std)
                     newlogprobs = dist.log_prob(mb_actions)
-                    entropy = dist.entropy()
+                    # distrax.Transformed has no closed-form entropy (tanh has
+                    # no analytic entropy correction); use the base Gaussian's
+                    # entropy as the exploration-bonus proxy, as before.
+                    entropy = dist.distribution.entropy()
                 else:
                     B,T=mb_actions.shape
                     newlogprobs=jax.nn.log_softmax(logits_new).reshape(B*T,-1)
