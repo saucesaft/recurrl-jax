@@ -174,11 +174,14 @@ class BaseAgent:
 
 
     def _eval_horizon(self):
-        # discover max_episode_length by walking the eval_env wrapper chain
+        # discover the episode horizon by walking the eval_env wrapper chain.
+        # BraxG1Env exposes it as max_episode_steps; keep max_episode_length
+        # too for any other env that names it that way.
         env=self.eval_env
         for _ in range(6):
-            if hasattr(env,'max_episode_length'):
-                return int(env.max_episode_length)
+            for attr in ('max_episode_steps','max_episode_length'):
+                if hasattr(env,attr):
+                    return int(getattr(env,attr))
             env=getattr(env,'env',None)
             if env is None:
                 break
@@ -216,10 +219,20 @@ class BaseAgent:
                 random_key,model_key=jax.random.split(random_key)
                 act_logits,_,h_tickminus1=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,1),term,h_tickminus1)
                 if self.is_continuous:
-                    mean,_=act_logits
-                    # deterministic action = tanh(mean), no clip needed:
-                    # tanh already bounds strictly within (-1, 1).
-                    acts_tick=jnp.tanh(mean.squeeze(axis=1))
+                    mean,log_std=act_logits
+                    if getattr(self,'eval_stochastic',False):
+                        # evaluate the policy as trained (sampled actions).
+                        # contact-rich tasks can learn noise-dependent behavior
+                        # where the bare mean is a different, worse controller;
+                        # selecting checkpoints by mean-eval then freezes early.
+                        random_key,noise_key=jax.random.split(random_key)
+                        std=jnp.exp(log_std)
+                        dist=squashed_gaussian(mean,std)
+                        acts_tick=dist.sample(seed=noise_key).squeeze(axis=1)
+                    else:
+                        # deterministic action = tanh(mean), no clip needed:
+                        # tanh already bounds strictly within (-1, 1).
+                        acts_tick=jnp.tanh(mean.squeeze(axis=1))
                 else:
                     acts_tick=jnp.argmax(act_logits,axis=-1).squeeze(axis=1)
                 o_tick,r_tick,term_step,trunc_step,info=self.eval_env.step(acts_tick)

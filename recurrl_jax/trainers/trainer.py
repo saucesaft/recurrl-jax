@@ -380,6 +380,22 @@ class Trainer(BaseTrainer):
                     self.random_key,
                     self.global_config['eval_episodes']
                 )
+                det_success_rate = getattr(self.agent, 'last_eval_success_rate', None)
+
+                # sampled-action eval, logged under its own keys: if the
+                # policy leans on its own action noise to stay upright, the
+                # stochastic rollout survives longer than the deterministic
+                # (mean) one -- a real signal, not visible from the
+                # deterministic number alone.
+                self.agent.eval_stochastic = True
+                stoch_avg_episode_len, stoch_avg_episode_return, _ = self.agent.evaluate(
+                    self.random_key,
+                    self.global_config['eval_episodes']
+                )
+                self.agent.eval_stochastic = False
+                stoch_success_rate = getattr(self.agent, 'last_eval_success_rate', None)
+                if det_success_rate is not None:
+                    self.agent.last_eval_success_rate = det_success_rate
 
                 if len(rollouts) > 0:
                     rollouts = np.concatenate(rollouts, axis=0)
@@ -399,6 +415,11 @@ class Trainer(BaseTrainer):
             metrics['eval_avg_episode_return'] = float(avg_episode_return)
             if hasattr(self.agent, 'last_eval_success_rate'):
                 metrics['eval_success_rate'] = float(self.agent.last_eval_success_rate)
+            if not (self.render_videos and self.video_config and self.video_render_fn is not None):
+                metrics['eval_stochastic_avg_episode_len'] = float(stoch_avg_episode_len)
+                metrics['eval_stochastic_avg_episode_return'] = float(stoch_avg_episode_return)
+                if stoch_success_rate is not None:
+                    metrics['eval_stochastic_success_rate'] = float(stoch_success_rate)
 
             # save checkpoint if best model
             if self.checkpoint_manager and avg_episode_return > self.best_eval_return:

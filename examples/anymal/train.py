@@ -41,7 +41,11 @@ def make_eval_env(env_config, trainer_config, global_config, train_envs):
         shared_running_mean_std=shared_rms,
         update_norm_stats=False,
     )
-    return rjxw.SqueezeWrapper(eval_env)
+    # NOTE: no SqueezeWrapper here -- BaseAgent.evaluate() is vectorized and
+    # expects a batched (num_envs, obs_dim) eval_env even at num_envs=1;
+    # squeezing the batch dim breaks its vmap (see g1/train.py's eval env,
+    # which never squeezed and is unaffected).
+    return eval_env
 
 def make_video_render_fn(eval_env):
     import mujoco
