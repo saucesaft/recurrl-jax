@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import optax
+import flax.traverse_util as ftu
 import pandas as pd
 import rlax
 import wandb
@@ -31,6 +32,21 @@ logger = logging.getLogger(__name__)
 # suppress verbose orbax/absl logging
 logging.getLogger('absl').setLevel(logging.ERROR)
 logging.getLogger('orbax').setLevel(logging.ERROR)
+
+
+def _param_group_labels(params):
+    """label every leaf 'actor', 'critic', or 'shared' (repr_model/seq_model,
+    which both heads backprop through) so the optimizer can clip each
+    group's gradient norm independently -- otherwise a single global clip
+    lets whichever loss term has the largest raw gradient (typically the
+    critic, given vf_coef and an unnormalized value scale) rescale
+    everyone else's update by the same factor, starving the actor."""
+    flat = ftu.flatten_dict(params)
+    labels = {}
+    for path in flat:
+        top = path[1] if path and path[0] == 'params' and len(path) > 1 else (path[0] if path else 'shared')
+        labels[path] = top if top in ('actor', 'critic') else 'shared'
+    return ftu.unflatten_dict(labels)
 
 
 class Trainer(BaseTrainer):
@@ -186,18 +202,22 @@ class Trainer(BaseTrainer):
 
             if self.trainer_config['ent_coef']['final'] is None:
                 self.trainer_config['ent_coef']['final']=self.trainer_config['ent_coef']['initial']
-            lr_schedule=optax.polynomial_schedule(learning_rate['initial'],learning_rate['final'],learning_rate.get('power', 1),learning_rate.get('max_decay_steps', self.global_config.steps))
-            ent_schedule=optax.polynomial_schedule(self.trainer_config['ent_coef']['initial'],self.trainer_config['ent_coef']['final'],
-                                                   self.trainer_config['ent_coef']['power'],self.trainer_config['ent_coef']['max_decay_steps'])
 
-            self.optimizer=optax.chain(
-                                optax.clip_by_global_norm(self.trainer_config['max_grad_norm']),
-                                optax.inject_hyperparams(optax.adamw)(
-                                    learning_rate=lr_schedule,
-                                    **optimizer_config
-                                ),
-                            )
-            # adaptive LR config
+            # lr_schedule/ent_schedule are indexed by update_tick (one tick per
+            # PPO update, i.e. per rollout of batch_size=num_envs*rollout_len
+            # env-steps -- see ppo.py), but max_decay_steps is written in
+            # config in raw env-step units (matching global_config.steps).
+            # Convert here so a run that lasts num_updates ticks actually
+            # reaches the end of the decay curve instead of the schedule
+            # barely moving off its initial value.
+            lr_max_decay_steps = max(1, learning_rate.get('max_decay_steps', self.global_config.steps) // batch_size)
+            ent_max_decay_steps = max(1, self.trainer_config['ent_coef']['max_decay_steps'] // batch_size)
+            lr_schedule=optax.polynomial_schedule(learning_rate['initial'],learning_rate['final'],learning_rate.get('power', 1),lr_max_decay_steps)
+            ent_schedule=optax.polynomial_schedule(self.trainer_config['ent_coef']['initial'],self.trainer_config['ent_coef']['final'],
+                                                   self.trainer_config['ent_coef']['power'],ent_max_decay_steps)
+
+            # adaptive LR config -- parsed before the optimizer is built,
+            # since it decides what we hand to inject_hyperparams below.
             adaptive_lr_config = self.trainer_config.get('adaptive_lr', {})
             if isinstance(adaptive_lr_config, bool):
                 adaptive_lr_enabled = adaptive_lr_config
@@ -209,6 +229,39 @@ class Trainer(BaseTrainer):
                 kl_threshold = adaptive_lr_config.get('kl_threshold', 0.02)
                 lr_min = adaptive_lr_config.get('lr_min', 1e-6)
                 lr_max = adaptive_lr_config.get('lr_max', 1e-2)
+
+            # clip actor/critic/shared-trunk grad norms separately (instead
+            # of one global clip over all params) so the critic's much
+            # larger raw gradient (unnormalized value scale, vf_coef) can't
+            # rescale the actor's update by the same factor and starve it.
+            group_clip_norm = self.trainer_config.get('max_grad_norm', 1.0)
+            # optax.inject_hyperparams re-evaluates a *callable* hyperparam
+            # from its own internal step count on every update() call, which
+            # clobbers any manual write into state.hyperparams before the
+            # inner update runs. That silently discarded every write the
+            # adaptive-LR rule made in ppo.py -- the logged current_lr was
+            # never the rate actually used; the schedule ran unmodified the
+            # whole time. Confirmed directly: after manually overwriting
+            # hyperparams['learning_rate'] and calling update() once more,
+            # the read-back value was the schedule's, not the override.
+            # Handing inject_hyperparams a plain float instead of the
+            # schedule callable makes it treat learning_rate as a normal,
+            # externally-settable hyperparameter, so the adaptive rule's
+            # write actually lands. Only do this when adaptive_lr is
+            # enabled -- otherwise the schedule alone should still drive it.
+            inject_lr = float(learning_rate['initial']) if adaptive_lr_enabled else lr_schedule
+            def _make_group_optimizer():
+                return optax.chain(
+                    optax.clip_by_global_norm(group_clip_norm),
+                    optax.inject_hyperparams(optax.adamw)(
+                        learning_rate=inject_lr,
+                        **optimizer_config
+                    ),
+                )
+            self.optimizer=optax.multi_transform(
+                {'actor': _make_group_optimizer(), 'critic': _make_group_optimizer(), 'shared': _make_group_optimizer()},
+                _param_group_labels,
+            )
 
             # TODO prettier way to pass parameters?
             self.agent=PPOAgent(train_envs=train_envs,eval_env=eval_env,optimizer=self.optimizer, repr_model_fn=repr_fn,
@@ -319,6 +372,21 @@ class Trainer(BaseTrainer):
             self.action_stds.append(float(diagnostics['action_std']))
             self.log_std_means.append(float(diagnostics['log_std_mean']))
             self.action_mean_abs_vals.append(float(diagnostics['action_mean_abs']))
+
+        # PPO optimization diagnostics: computed every step, previously
+        # discarded here without ever reaching the logs.
+        if not hasattr(self, 'approx_kls'):
+            self.approx_kls = []
+            self.actor_grad_norms = []
+            self.critic_grad_norms = []
+            self.action_saturation_fracs = []
+            self.current_lrs = []
+        self.approx_kls.append(float(diagnostics['approx_kl']))
+        self.actor_grad_norms.append(float(diagnostics['actor_grad_norm']))
+        self.critic_grad_norms.append(float(diagnostics['critic_grad_norm']))
+        self.action_saturation_fracs.append(float(diagnostics['action_saturation_frac']))
+        if diagnostics.get('current_lr') is not None:
+            self.current_lrs.append(float(diagnostics['current_lr']))
         if self.step_count>=self.next_log_step:
             #calculate and log mean of statistic_data
             metrics={}
@@ -354,8 +422,18 @@ class Trainer(BaseTrainer):
             metrics={'step':self.step_count,'sps':mean_sps,'loss':loss,'critic_loss':critic_loss,
                                     'actor_loss':actor_loss,'entropy_loss':entropy_loss,'mean_reward':reward_mean,
                                     'return_per_episode':return_mean,
+                                    'approx_kl':np.mean(self.approx_kls),
+                                    'actor_grad_norm':np.mean(self.actor_grad_norms),
+                                    'critic_grad_norm':np.mean(self.critic_grad_norms),
+                                    'action_saturation_frac':np.mean(self.action_saturation_fracs),
+                                    **({'current_lr':np.mean(self.current_lrs)} if self.current_lrs else {}),
                                     **metrics
                                     }
+            self.approx_kls=[]
+            self.actor_grad_norms=[]
+            self.critic_grad_norms=[]
+            self.action_saturation_fracs=[]
+            self.current_lrs=[]
             self.result_data.append(metrics)
         else:
             metrics=None
