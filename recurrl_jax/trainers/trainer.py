@@ -79,6 +79,26 @@ class Trainer(BaseTrainer):
             )
             logger.info(f"Checkpoint manager initialized at {checkpoint_path}")
 
+        # periodic checkpoint, independent of save_best_only/eval -- a
+        # save_best_only run can go arbitrarily long without a new "best"
+        # checkpoint if eval return plateaus while training keeps moving,
+        # silently leaving the on-disk checkpoint stale relative to the
+        # live policy. this is a safety net, kept in a separate directory
+        # so it never competes with the best-checkpoint manager's
+        # max_to_keep=1 eviction.
+        self.checkpoint_interval = self.global_config.get('checkpoint_interval', None)
+        self.periodic_checkpoint_manager = None
+        if self.checkpoint_dir and self.checkpoint_interval:
+            self.next_checkpoint_step = self.checkpoint_interval
+            periodic_path = Path(self.checkpoint_dir).resolve().parent / (Path(self.checkpoint_dir).name + '_periodic')
+            periodic_path.mkdir(parents=True, exist_ok=True)
+            self.periodic_checkpoint_manager = CheckpointManager(
+                periodic_path,
+                PyTreeCheckpointer(),
+                options=CheckpointManagerOptions(max_to_keep=3, create=True)
+            )
+            logger.info(f"Periodic checkpoint manager initialized at {periodic_path} (every {self.checkpoint_interval} steps)")
+
         # video rendering setup
         self.video_dir = self.global_config.get('video_dir', None)
         self.render_videos = self.global_config.get('render_videos', False)
@@ -499,36 +519,48 @@ class Trainer(BaseTrainer):
                 if stoch_success_rate is not None:
                     metrics['eval_stochastic_success_rate'] = float(stoch_success_rate)
 
-            # save checkpoint if best model
-            if self.checkpoint_manager and avg_episode_return > self.best_eval_return:
-                self.best_eval_return = avg_episode_return
-
-                checkpoint_state = {
-                    'params': self.agent.params,
-                    'optimizer_state': self.agent.optimizer_state,
-                    'update_tick': np.array(self.agent.update_tick),
-                    'step_count': self.step_count,
-                    'best_eval_return': float(self.best_eval_return),
-                }
-
-                # save obs normalisation stats if available
-                rms_env = getattr(self.agent, 'eval_env', None)
-                if rms_env is None:
-                    rms_env = getattr(self.agent, 'train_envs', None)
-                # unwrap one level (SqueezeWrapper / VectorEpisodeStatisticsWrapper)
-                if rms_env is not None and not hasattr(rms_env, 'running_mean_std'):
-                    rms_env = getattr(rms_env, 'env', rms_env)
-                rms = getattr(rms_env, 'running_mean_std', None)
-                if rms is not None:
-                    checkpoint_state['obs_mean'] = np.array(rms.mean)
-                    checkpoint_state['obs_var'] = np.array(rms.var)
-
+            # save checkpoint: best-by-eval-return by default; save_best_only=false
+            # saves at EVERY eval (max_to_keep=1 -> latest survives), so the final
+            # policy is never silently discarded when eval peaks early.
+            save_best_only = bool(self.global_config.get('save_best_only', True))
+            is_best = avg_episode_return > self.best_eval_return
+            if self.checkpoint_manager and (is_best or not save_best_only):
+                self.best_eval_return = max(self.best_eval_return, float(avg_episode_return))
+                checkpoint_state = self._build_checkpoint_state()
                 self.checkpoint_manager.save(self.step_count, checkpoint_state)
                 logger.info(f"Saved best checkpoint at step {self.step_count} "
                             f"with eval return {self.best_eval_return:.2f}")
                 metrics['checkpoint_saved'] = True
 
+        if self.periodic_checkpoint_manager is not None and self.step_count>=self.next_checkpoint_step:
+            self.next_checkpoint_step+=self.checkpoint_interval
+            self.periodic_checkpoint_manager.save(self.step_count, self._build_checkpoint_state())
+            logger.info(f"Saved periodic checkpoint at step {self.step_count}")
+            if metrics is not None:
+                metrics['periodic_checkpoint_saved'] = True
+
         return loss,metrics,self.step_count
+
+    def _build_checkpoint_state(self):
+        checkpoint_state = {
+            'params': self.agent.params,
+            'optimizer_state': self.agent.optimizer_state,
+            'update_tick': np.array(self.agent.update_tick),
+            'step_count': self.step_count,
+            'best_eval_return': float(self.best_eval_return),
+        }
+        # save obs normalisation stats if available
+        rms_env = getattr(self.agent, 'eval_env', None)
+        if rms_env is None:
+            rms_env = getattr(self.agent, 'train_envs', None)
+        # unwrap one level (SqueezeWrapper / VectorEpisodeStatisticsWrapper)
+        if rms_env is not None and not hasattr(rms_env, 'running_mean_std'):
+            rms_env = getattr(rms_env, 'env', rms_env)
+        rms = getattr(rms_env, 'running_mean_std', None)
+        if rms is not None:
+            checkpoint_state['obs_mean'] = np.array(rms.mean)
+            checkpoint_state['obs_var'] = np.array(rms.var)
+        return checkpoint_state
 
 
     def get_summary_table(self):
