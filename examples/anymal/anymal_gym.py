@@ -4,6 +4,7 @@ import jax.random as jr
 
 from examples.anymal.anymal_env import DiffAnymal
 from recurrl_jax.utils.wrappers import MJXGymWrapper
+from recurrl_jax.utils.auto_reset import sparse_auto_reset
 
 
 class BraxAnymalEnv:
@@ -14,9 +15,12 @@ class BraxAnymalEnv:
         self.num_envs = num_envs
         self.key = key
         self.state = None
+        # done envs are auto-reset in chunks of this size (see sparse_auto_reset)
+        self.max_resets_per_step = max(1, num_envs // 16)
 
         self._vmap_reset = jax.jit(jax.vmap(self.env.reset))
         self._vmap_step = jax.jit(jax.vmap(self.env.step))
+        self._functional_step_jit = jax.jit(self.functional_step)
 
         self.reset()
 
@@ -26,32 +30,41 @@ class BraxAnymalEnv:
         self.state = self._vmap_reset(keys)
         return self.state
 
-    def step(self, actions: jnp.ndarray):
-        self.key, reset_key = jr.split(self.key)
+    @property
+    def functional_state(self):
+        return (self.state, self.key)
 
-        next_state = self._vmap_step(self.state, actions)
+    @functional_state.setter
+    def functional_state(self, fstate):
+        self.state, self.key = fstate
+
+    def functional_step(self, fstate, actions: jnp.ndarray):
+        """pure step + auto-reset; (state, key) in, (state, key) out."""
+        state, key = fstate
+        key, reset_key = jr.split(key)
+
+        next_state = jax.vmap(self.env.step)(state, actions)
         done = next_state.done.astype(bool)
 
-        # auto-reset terminated environments
+        # auto-reset terminated environments: keep next_state for ongoing
+        # envs, fresh reset states for done envs (only done envs are reset)
         reset_keys = jr.split(reset_key, self.num_envs)
-        reset_states = self._vmap_reset(reset_keys)
-
-        # keep next_state for ongoing envs; use reset_states for done envs
-        self.state = jax.tree_util.tree_map(
-            lambda r, n: jnp.where(
-                done.reshape((-1,) + (1,) * (r.ndim - 1)) if r.ndim > 1 else done,
-                r, n,
-            ),
-            reset_states, next_state,
-        )
+        new_state = sparse_auto_reset(
+            self.env.reset, (reset_keys,), done, next_state, self.max_resets_per_step)
 
         # curriculum_step is global training progress — never reset on episode end
-        self.state = self.state.replace(
-            info={**self.state.info,
+        new_state = new_state.replace(
+            info={**new_state.info,
                   'curriculum_step': next_state.info['curriculum_step']}
         )
 
-        return self.state, next_state.reward, done, done, next_state.metrics
+        return (new_state, key), next_state.reward, done, done, next_state.metrics
+
+    def step(self, actions: jnp.ndarray):
+        fstate, reward, reset_mask, termination, metrics = self._functional_step_jit(
+            self.functional_state, actions)
+        self.functional_state = fstate
+        return self.state, reward, reset_mask, termination, metrics
 
     def sync_curriculum_step(self, env_steps: int):
         """Sync curriculum counter into all envs' state_info."""
@@ -87,3 +100,7 @@ class AnymalGymWrapper(MJXGymWrapper):
 
     def _get_obs(self) -> jnp.ndarray:
         return self.env.state.obs
+
+    def _get_obs_fn(self, env_fstate, last_actions) -> jnp.ndarray:
+        state, _ = env_fstate
+        return state.obs
