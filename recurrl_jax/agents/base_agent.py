@@ -107,8 +107,11 @@ class BaseAgent:
         # fully-jitted rollouts when the env implements the functional
         # protocol (see recurrl_jax.utils.wrappers), python step loop otherwise
         self.functional_env=is_functional_env(self.env)
+        self.functional_eval_env=eval_env is not None and is_functional_env(eval_env)
         self._policy_step_jit=jax.jit(self._policy_step)
         self._scan_rollout_jit=jax.jit(self._scan_rollout)
+        self._eval_step_jit=jax.jit(self._eval_step,static_argnames=('stochastic',))
+        self._eval_scan_jit=jax.jit(self._eval_scan,static_argnames=('horizon','stochastic'))
         if self.functional_env:
             logger.info("Env supports functional stepping: rollouts run as one jitted scan")
         else:
@@ -314,59 +317,85 @@ class BaseAgent:
                 break
         return 1000
 
+    def _eval_actions(self,act_logits,noise_key,stochastic):
+        if self.is_continuous:
+            mean,log_std=act_logits
+            if stochastic:
+                # evaluate the policy as trained (sampled actions).
+                # contact-rich tasks can learn noise-dependent behavior
+                # where the bare mean is a different, worse controller;
+                # selecting checkpoints by mean-eval then freezes early.
+                std=jnp.exp(log_std)
+                dist=squashed_gaussian(mean,std)
+                return dist.sample(seed=noise_key).squeeze(axis=1)
+            # deterministic action = tanh(mean), no clip needed:
+            # tanh already bounds strictly within (-1, 1).
+            return jnp.tanh(mean.squeeze(axis=1))
+        return jnp.argmax(act_logits,axis=-1).squeeze(axis=1)
+
+    def _eval_step(self,params,step_key,o_tick,term,h_tickminus1,stochastic):
+        model_key,noise_key=jax.random.split(step_key)
+        act_logits,_,h_tickminus1=self.actor_critic_fn(model_key,params,jnp.expand_dims(o_tick,1),term,h_tickminus1)
+        return self._eval_actions(act_logits,noise_key,stochastic),h_tickminus1
+
+    def _eval_scan(self,params,env_fstate,o_tick,random_key,horizon,stochastic):
+        """pure fixed-horizon eval rollout over a functional eval env."""
+        n_envs=o_tick.shape[0]
+        h_tickminus1=jax.tree.map(lambda x:jnp.repeat(jnp.expand_dims(x,0),n_envs,axis=0),self.seq_init())
+
+        def body(c,step_key):
+            env_fstate,o_tick,term,h_tickminus1,alive,ep_ret,ep_len=c
+            acts_tick,h_tickminus1=self._eval_step(params,step_key,o_tick,term,h_tickminus1,stochastic)
+            env_fstate,o_next,r_tick,term_step,trunc_step,_=self.eval_env.functional_step(env_fstate,acts_tick)
+            ep_ret=ep_ret+r_tick*alive.astype(jnp.float32)
+            ep_len=ep_len+alive.astype(jnp.int32)
+            alive=alive&jnp.logical_not(term_step)  # freeze contribution on real drop
+            term=jnp.expand_dims(jnp.logical_or(term_step,trunc_step),1)
+            return (env_fstate,o_next.astype(o_tick.dtype),term,h_tickminus1,alive,ep_ret,ep_len),None
+
+        c=(env_fstate,o_tick,jnp.zeros((n_envs,1),dtype=bool),h_tickminus1,
+           jnp.ones((n_envs,),dtype=bool),jnp.zeros((n_envs,),dtype=jnp.float32),jnp.zeros((n_envs,),dtype=jnp.int32))
+        (env_fstate,_,_,_,_,ep_ret,ep_len),_=jax.lax.scan(body,c,jax.random.split(random_key,horizon))
+        return env_fstate,ep_len,ep_ret
+
     def evaluate(self,random_key,eval_episodes):
-        # vectorized, deterministic eval over a *batched* eval_env.
+        # vectorized eval over a *batched* eval_env.
         #
         # runs fixed-horizon rollouts across all eval_env.num_envs in parallel
-        # with NO per-step host sync. the previous impl looped one env, one step
-        # at a time, converting done->python bool every step (device sync per
-        # step); once episodes survived full length this was pathologically slow.
-        # each env contributes one episode: reward is accumulated until that env
-        # first *terminates* (a real drop), so survivors get full credit and
-        # post-drop auto-reset steps are masked out. actions are deterministic
-        # (mean / argmax) and return is the undiscounted episode sum, matching
-        # the training return_per_episode metric.
+        # with NO per-step host sync (one jitted scan per round when the eval
+        # env is functional). each env contributes one episode: reward is
+        # accumulated until that env first *terminates* (a real drop), so
+        # survivors get full credit and post-drop auto-reset steps are masked
+        # out. actions are deterministic (mean / argmax) unless
+        # self.eval_stochastic is set, and return is the undiscounted episode
+        # sum, matching the training return_per_episode metric.
         n_envs=self.eval_env.num_envs
         horizon=self._eval_horizon()
-
-        def init_hidden():
-            return jax.tree.map(lambda x:jnp.repeat(jnp.expand_dims(x,0),n_envs,axis=0),self.seq_init())
+        stochastic=bool(getattr(self,'eval_stochastic',False))
 
         all_lens=[]
         all_rets=[]
         n_rounds=max(1,-(-eval_episodes//n_envs))  # ceil, so we cover >= eval_episodes
         for _ in tqdm.tqdm(range(n_rounds)):
+            random_key,round_key=jax.random.split(random_key)
             o_tick,_=self.eval_env.reset()
-            h_tickminus1=init_hidden()
-            term=jnp.zeros((n_envs,1),dtype=bool)      # RNN reset signal (done)
-            alive=jnp.ones((n_envs,),dtype=bool)       # still in first episode
-            ep_ret=jnp.zeros((n_envs,),dtype=jnp.float32)
-            ep_len=jnp.zeros((n_envs,),dtype=jnp.int32)
-            for t in range(horizon):
-                random_key,model_key=jax.random.split(random_key)
-                act_logits,_,h_tickminus1=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,1),term,h_tickminus1)
-                if self.is_continuous:
-                    mean,log_std=act_logits
-                    if getattr(self,'eval_stochastic',False):
-                        # evaluate the policy as trained (sampled actions).
-                        # contact-rich tasks can learn noise-dependent behavior
-                        # where the bare mean is a different, worse controller;
-                        # selecting checkpoints by mean-eval then freezes early.
-                        random_key,noise_key=jax.random.split(random_key)
-                        std=jnp.exp(log_std)
-                        dist=squashed_gaussian(mean,std)
-                        acts_tick=dist.sample(seed=noise_key).squeeze(axis=1)
-                    else:
-                        # deterministic action = tanh(mean), no clip needed:
-                        # tanh already bounds strictly within (-1, 1).
-                        acts_tick=jnp.tanh(mean.squeeze(axis=1))
-                else:
-                    acts_tick=jnp.argmax(act_logits,axis=-1).squeeze(axis=1)
-                o_tick,r_tick,term_step,trunc_step,info=self.eval_env.step(acts_tick)
-                ep_ret=ep_ret+r_tick*alive.astype(jnp.float32)
-                ep_len=ep_len+alive.astype(jnp.int32)
-                alive=alive&jnp.logical_not(term_step)  # freeze contribution on real drop
-                term=jnp.expand_dims(jnp.logical_or(term_step,trunc_step),1)
+            if self.functional_eval_env:
+                env_fstate,ep_len,ep_ret=self._eval_scan_jit(self.params,self.eval_env.functional_state,o_tick,round_key,
+                                                             horizon=horizon,stochastic=stochastic)
+                self.eval_env.functional_state=env_fstate
+            else:
+                h_tickminus1=jax.tree.map(lambda x:jnp.repeat(jnp.expand_dims(x,0),n_envs,axis=0),self.seq_init())
+                term=jnp.zeros((n_envs,1),dtype=bool)      # RNN reset signal (done)
+                alive=jnp.ones((n_envs,),dtype=bool)       # still in first episode
+                ep_ret=jnp.zeros((n_envs,),dtype=jnp.float32)
+                ep_len=jnp.zeros((n_envs,),dtype=jnp.int32)
+                for step_key in jax.random.split(round_key,horizon):
+                    acts_tick,h_tickminus1=self._eval_step_jit(self.params,step_key,o_tick,term,h_tickminus1,stochastic=stochastic)
+                    o_tick,r_tick,term_step,trunc_step,info=self.eval_env.step(acts_tick)
+                    ep_ret=ep_ret+r_tick*alive.astype(jnp.float32)
+                    ep_len=ep_len+alive.astype(jnp.int32)
+                    alive=alive&jnp.logical_not(term_step)  # freeze contribution on real drop
+                    term=jnp.expand_dims(jnp.logical_or(term_step,trunc_step),1)
             all_lens.append(ep_len)
             all_rets.append(ep_ret)
         lens=jnp.concatenate(all_lens)
