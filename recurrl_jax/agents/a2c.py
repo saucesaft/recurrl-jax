@@ -75,11 +75,11 @@ class A2CAgent(BaseAgent):
         h_tickminus1=jax.tree.map(lambda x: x,self.h_tickminus1) #copy the hidden state
         unroll_key,update_key=jax.random.split(random_key)
         unroll_data=self.unroll_actors(unroll_key)
-        observations,actions,rewards,terminations,infos=unroll_data.observations,unroll_data.actions, \
-                                            unroll_data.rewards,unroll_data.terminations,unroll_data.infos
+        observations,actions,rewards,terminations,info_stats=unroll_data.observations,unroll_data.actions, \
+                                            unroll_data.rewards,unroll_data.terminations,unroll_data.info_stats
 
         #take a learner step
         (loss,(value_loss,entropy_loss,actor_loss)),self.params,self.optimizer_state=self.step_fn(self.params,
                                 self.optimizer_state,update_key,observations,actions,
                                 rewards,terminations,h_tickminus1)
-        return (loss,(value_loss,entropy_loss,actor_loss,rewards[:,1:]),infos)
+        return (loss,(value_loss,entropy_loss,actor_loss,rewards[:,1:].sum()),info_stats)
