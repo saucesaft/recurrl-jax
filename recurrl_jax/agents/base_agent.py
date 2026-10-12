@@ -12,6 +12,7 @@ from typing import Callable
 from recurrl_jax.utils.recurrent_utils import tree_index
 from recurrl_jax.models.actor_critic import ActorCriticModel
 from recurrl_jax.utils.distributions import squashed_gaussian
+from recurrl_jax.utils.wrappers import is_functional_env
 from argparse import Namespace
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,58 @@ def jax_to_numpy(*args):
 
 def numpy_to_jax(*args,dtype=jnp.float32):
     return jax.tree.map(lambda x: jnp.array(x,dtype=dtype),args)
+
+
+# info keys that are bookkeeping, not diagnostics
+_SKIP_INFO_KEYS=('episode','done','termination')
+
+def summarize_infos(infos):
+    """reduce time-stacked step infos (leaves shaped (T, num_envs, ...)) to
+    scalars, on device. per-env arrays become diag_{key}_mean (mean over
+    steps and envs) and diag_{key}_max (per-step max, averaged over steps);
+    per-step scalars are averaged under their own key. infos['episode'] (see
+    VectorEpisodeStatisticsWrapper) becomes sums over finished episodes."""
+    stats={}
+    episode=infos.get('episode')
+    if isinstance(episode,dict):
+        done=episode['done'].astype(jnp.float32)
+        stats['episode']={
+            'count':done.sum(),
+            'r_sum':(episode['r'].astype(jnp.float32)*done).sum(),
+            'l_sum':(episode['l'].astype(jnp.float32)*done).sum(),
+        }
+    for key,val in infos.items():
+        if key in _SKIP_INFO_KEYS or not isinstance(val,(jax.Array,np.ndarray)):
+            continue
+        if not (jnp.issubdtype(val.dtype,jnp.number) or val.dtype==jnp.bool_):
+            continue
+        val=jnp.asarray(val,dtype=jnp.float32)
+        if val.ndim>1:
+            stats[f'diag_{key}_mean']=val.mean()
+            stats[f'diag_{key}_max']=val.reshape(val.shape[0],-1).max(axis=1).mean()
+        else:
+            stats[key]=val.mean()
+    return stats
+
+_summarize_infos_jit=jax.jit(summarize_infos)
+
+def _stack_infos(infos):
+    """stack a python list of per-step info dicts along a leading time axis,
+    keeping only keys every step has and that hold numbers/arrays."""
+    if not infos:
+        return {}
+    keys=set(infos[0]).intersection(*infos[1:])
+    stacked={}
+    for key in keys:
+        vals=[info[key] for info in infos]
+        try:
+            if isinstance(vals[0],dict):
+                stacked[key]=jax.tree.map(lambda *xs: jnp.stack(xs),*vals)
+            elif all(isinstance(v,(int,float,np.number,np.ndarray,jax.Array)) for v in vals):
+                stacked[key]=jnp.stack([jnp.asarray(v) for v in vals])
+        except (TypeError,ValueError):
+            pass  # ragged / non-numeric across steps: not loggable
+    return stacked
 
 
 class BaseAgent:
@@ -51,6 +104,15 @@ class BaseAgent:
 
         self.actor_critic_fn=actor_critic_fn
 
+        # fully-jitted rollouts when the env implements the functional
+        # protocol (see recurrl_jax.utils.wrappers), python step loop otherwise
+        self.functional_env=is_functional_env(self.env)
+        self._policy_step_jit=jax.jit(self._policy_step)
+        self._scan_rollout_jit=jax.jit(self._scan_rollout)
+        if self.functional_env:
+            logger.info("Env supports functional stepping: rollouts run as one jitted scan")
+        else:
+            logger.info("Env has no functional_step: rollouts use the python step loop")
 
 
     def reset(self,params_key,random_key):
@@ -76,101 +138,166 @@ class BaseAgent:
     def params(self, value):
         self._params = value
 
+    @property
+    def rollout_carry(self):
+        # agent-side state threaded from one rollout into the next
+        return {'o':self.o_tick,'r':self.r_tick,'term':self.term_tick,
+                'true_term':self.true_term_tick,'h':self.h_tickminus1}
+
+    @rollout_carry.setter
+    def rollout_carry(self,carry):
+        self.o_tick=carry['o']
+        self.r_tick=carry['r']
+        self.term_tick=carry['term']
+        self.true_term_tick=carry['true_term']
+        self.h_tickminus1=carry['h']
+
+    def _sample_actions(self,random_key,act_logits):
+        if self.is_continuous:
+            mean, log_std = act_logits
+            std = jnp.exp(log_std)
+            dist = squashed_gaussian(mean, std)
+            # sample is already tanh-squashed into (-1, 1); this is what
+            # gets executed AND what log_prob is later evaluated on, so
+            # there's no train/eval action mismatch and no need to clip.
+            return dist.sample(seed=random_key).squeeze(axis=1)
+        elif self.use_gumbel_sampling:
+            # sample action: Gumbel-softmax trick
+            # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
+            u = jax.random.uniform(random_key, shape=act_logits.shape)
+            return jnp.argmax(act_logits - jnp.log(-jnp.log(u)), axis=-1).squeeze(axis=-1)
+        else:
+            return jax.random.categorical(random_key,act_logits).squeeze(axis=-1)
+
+    def _policy_step(self,params,random_key,o_tick,term_tick,h_tickminus1):
+        # one acting step for all envs: forward pass + action sampling
+        model_key,sample_key=jax.random.split(random_key)
+        act_logits,v_tick,htick=self.actor_critic_fn(model_key,params,jnp.expand_dims(o_tick,1),jnp.expand_dims(term_tick,1),
+                                                     h_tickminus1)
+        acts_tick=self._sample_actions(sample_key,act_logits)
+        return acts_tick,act_logits,v_tick,htick
+
+    def _assemble_batch(self,steps,carry,v_last,hiddens):
+        # steps: per-step records shaped num_actorsXrollout_lenX*...; append
+        # the final observation/reward/termination and the bootstrap value
+        num_envs=carry['r'].shape[0]
+        num_seqs=self.rollout_len//self.sequence_length
+        append=lambda xs,x: jnp.concatenate([xs,jnp.expand_dims(x,1)],axis=1)
+        hidden_indices=jnp.arange(self.rollout_len).reshape(num_seqs,self.sequence_length)
+        return {
+            'observations':append(steps['observations'],carry['o']),
+            'actions':steps['actions'],
+            'rewards':append(steps['rewards'],carry['r']),
+            'terminations':append(steps['terminations'],carry['term']),
+            'true_terminations':append(steps['true_terminations'],carry['true_term']),
+            'critic_preds':jnp.squeeze(append(steps['critic_preds'],v_last),axis=-1),
+            'actor_preds':steps['actor_preds'],
+            'hiddens':hiddens,
+            'hidden_indices':jnp.broadcast_to(hidden_indices,(num_envs,)+hidden_indices.shape),
+        }
+
+    def _scan_rollout(self,params,env_fstate,carry,random_key):
+        """pure rollout of rollout_len steps over a functional env.
+
+        returns (env_fstate, carry, batch, info_stats); the batch layout
+        matches the python-loop unroll exactly."""
+        num_seqs=self.rollout_len//self.sequence_length
+
+        def env_step(c,step_key):
+            env_fstate,carry=c
+            acts_tick,act_logits,v_tick,htick=self._policy_step(params,step_key,carry['o'],carry['term'],carry['h'])
+            env_fstate,o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1,info=self.env.functional_step(env_fstate,acts_tick)
+            record={
+                'observations':carry['o'],
+                'rewards':carry['r'],
+                'terminations':carry['term'],  # combined done for RNN
+                'true_terminations':carry['true_term'],  # true term only for GAE
+                'critic_preds':v_tick,
+                'actor_preds':act_logits,
+                'actions':acts_tick,
+                'infos':info,
+            }
+            carry={
+                'o':o_tickplus1.astype(carry['o'].dtype),
+                'r':r_tickplus1.astype(carry['r'].dtype),
+                'term':jnp.logical_or(term_tickplus1,trunc_tickplus1),
+                'true_term':jnp.asarray(term_tickplus1,dtype=bool),
+                'h':htick,
+            }
+            return (env_fstate,carry),record
+
+        def seq_step(c,seq_keys):
+            # store the hidden state at the start of every sequence
+            h_start=c[1]['h']
+            c,records=jax.lax.scan(env_step,c,seq_keys)
+            return c,(records,h_start)
+
+        step_keys=jax.random.split(random_key,self.rollout_len+1)
+        seq_keys=step_keys[:-1].reshape((num_seqs,self.sequence_length)+step_keys.shape[1:])
+        (env_fstate,carry),(records,hiddens)=jax.lax.scan(seq_step,(env_fstate,carry),seq_keys)
+
+        # (num_seqs, sequence_length, num_envs, ...) -> (rollout_len, num_envs, ...)
+        records=jax.tree.map(lambda x: x.reshape((self.rollout_len,)+x.shape[2:]),records)
+        info_stats=summarize_infos(records.pop('infos'))
+        # time-major -> num_actorsXrollout_lenX*...
+        records=jax.tree.map(lambda x: jnp.swapaxes(x,0,1),records)
+        hiddens=jax.tree.map(lambda x: jnp.swapaxes(x,0,1),hiddens)
+
+        #get the value for timestep (tick+rollout_len+1), needed for bootstrapping
+        _,v_last,_=self.actor_critic_fn(step_keys[-1],params,jnp.expand_dims(carry['o'],1),jnp.expand_dims(carry['term'],1),carry['h'])
+        return env_fstate,carry,self._assemble_batch(records,carry,v_last,hiddens),info_stats
+
     def unroll_actors(self,random_key):
         #unrolls the actor for rollout_len steps, takes rollout_len actions
-        num_seqs=self.rollout_len//self.sequence_length
-        h_tickminus1=self.h_tickminus1
-        o_tick=self.o_tick
-        r_tick=self.r_tick
-        term_tick=self.term_tick  # combined done flag (term OR trunc)
-        true_term_tick=self.true_term_tick  # only true terminations
-        actions=[]
-        observations=[]
-        rewards=[]
-        critic_preds=[]
-        actor_preds=[]
-        terminations=[]  # combined done flag (term OR trunc) for RNN resets
-        true_terminations=[]  # only true terminations for GAE bootstrap
+        if self.functional_env:
+            env_fstate,carry,batch,info_stats=self._scan_rollout_jit(self.params,self.env.functional_state,
+                                                                    self.rollout_carry,random_key)
+            self.env.functional_state=env_fstate
+            self.rollout_carry=carry
+            self.tick+=self.rollout_len
+            return Namespace(**batch,info_stats=info_stats)
+
+        carry=self.rollout_carry
+        steps={k:[] for k in ('observations','rewards','terminations','true_terminations',
+                              'critic_preds','actor_preds','actions')}
         hiddens=[] #we still store the hidden states for every start
-        hidden_indices=[] #to map hidden states to the correct timestep
         infos=[]
+        # same key schedule as _scan_rollout
+        step_keys=jax.random.split(random_key,self.rollout_len+1)
         for t in range(self.rollout_len):
-            #add observation and reward and timestep tick
-            observations.append(o_tick.copy())
-            rewards.append(r_tick.copy())
-            terminations.append(term_tick.copy())  # combined done for RNN
-            true_terminations.append(true_term_tick.copy())  # true term only for GAE (carries from prev rollout)
-            random_key,model_key=jax.random.split(random_key)
+            step_key=step_keys[t]
             #add hidden state for each sequence
-            if t%self.sequence_length==0: #if it is time to update the hidden state
-                #store the hidden state
-                hiddens.append(jax.tree.map(lambda x:x,h_tickminus1))
-                hidden_indices.append(jnp.repeat(jnp.arange(t,t+self.sequence_length).reshape(1,-1),repeats=self.env.num_envs,axis=0))
-
-
-            act_logits,v_tick,htick=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,1),jnp.expand_dims(term_tick,1),
-                                                         h_tickminus1)
-            if self.is_continuous:
-                mean, log_std = act_logits
-                std = jnp.exp(log_std)
-                dist = squashed_gaussian(mean, std)
-                # sample is already tanh-squashed into (-1, 1); this is what
-                # gets executed AND what log_prob is later evaluated on, so
-                # there's no train/eval action mismatch and no need to clip.
-                acts_tick = dist.sample(seed=random_key).squeeze(axis=1)
-            elif self.use_gumbel_sampling:
-                # sample action: Gumbel-softmax trick
-                # see https://stats.stackexchange.com/questions/359442/sampling-from-a-categorical-distribution
-                u = jax.random.uniform(random_key, shape=act_logits.shape)
-                acts_tick=jnp.argmax(act_logits - jnp.log(-jnp.log(u)), axis=-1).squeeze(axis=-1)
-            else:
-                acts_tick=jax.random.categorical(random_key,act_logits).squeeze(axis=-1)
+            if t%self.sequence_length==0:
+                hiddens.append(carry['h'])
+            acts_tick,act_logits,v_tick,htick=self._policy_step_jit(self.params,step_key,carry['o'],carry['term'],carry['h'])
             #take a step in the environment
             o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1,info=self.env.step(acts_tick)
 
-            true_term_tickplus1 = term_tickplus1
-            done_tickplus1 = jnp.logical_or(term_tickplus1, trunc_tickplus1)
-
-            #add action at timestep tick
-            critic_preds.append(v_tick.copy())
-            actor_preds.append(jax.tree.map(lambda x: x.copy(), act_logits))
-            actions.append(acts_tick.copy())
+            #add observation, reward and terminations at timestep tick
+            steps['observations'].append(carry['o'])
+            steps['rewards'].append(carry['r'])
+            steps['terminations'].append(carry['term'])  # combined done for RNN
+            steps['true_terminations'].append(carry['true_term'])  # true term only for GAE (carries from prev rollout)
+            steps['critic_preds'].append(v_tick)
+            steps['actor_preds'].append(act_logits)
+            steps['actions'].append(acts_tick)
             infos.append(info)
-            o_tick=o_tickplus1
-            r_tick=r_tickplus1
-            h_tickminus1=htick
-            term_tick=done_tickplus1
-            true_term_tick=true_term_tickplus1
+            carry={
+                'o':o_tickplus1,
+                'r':r_tickplus1,
+                'term':jnp.logical_or(term_tickplus1,trunc_tickplus1),
+                'true_term':jnp.asarray(term_tickplus1),
+                'h':htick,
+            }
             self.tick+=1
-        #add the last observation and reward
-        observations.append(o_tick)
-        rewards.append(r_tick)
-        terminations.append(term_tick)
-        true_terminations.append(true_term_tick)
         #get the value for timestep (tick+rollout_len+1), needed for bootstrapping
-        random_key,model_key=jax.random.split(random_key)
-        _,v_tick,_=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,1),jnp.expand_dims(term_tick,1),h_tickminus1)
-        critic_preds.append(v_tick)
-        #update to timestep
-        self.o_tick=o_tick.copy()
-        self.r_tick=r_tick.copy()
-        self.h_tickminus1=jax.tree.map(lambda x:x,h_tickminus1) #copy the hidden state, it can be arbitrary tree structure
-        self.term_tick=term_tick.copy()
-        self.true_term_tick=true_term_tick.copy()
+        _,v_last,_=self.actor_critic_fn(step_keys[-1],self.params,jnp.expand_dims(carry['o'],1),jnp.expand_dims(carry['term'],1),carry['h'])
+        self.rollout_carry=carry
         #shape is num_actorsXrollout_lenX*...
+        steps={k:jax.tree.map(lambda *xs: jnp.stack(xs,1),*v) for k,v in steps.items()}
         hidden_stacked=jax.tree.map(lambda *args: jnp.stack(args,1), *hiddens)
-        return Namespace(**{
-            'observations':jnp.stack(observations,1),
-            'actions':jnp.stack(actions,1),
-            'rewards':jnp.stack(rewards,1),
-            'terminations':jnp.stack(terminations,1),
-            'true_terminations':jnp.stack(true_terminations,1),
-            'infos':infos,
-            'critic_preds':jnp.squeeze(jnp.stack(critic_preds,1),axis=-1),
-            'actor_preds':jax.tree.map(lambda *xs: jnp.stack(xs, 1), *actor_preds),
-            'hiddens':hidden_stacked,
-            'hidden_indices':jnp.stack(hidden_indices,1)
-        })
+        batch=self._assemble_batch(steps,carry,v_last,hidden_stacked)
+        return Namespace(**batch,info_stats=_summarize_infos_jit(_stack_infos(infos)))
 
 
     def _eval_horizon(self):

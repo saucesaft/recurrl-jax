@@ -314,7 +314,6 @@ class Trainer(BaseTrainer):
         self.step_count=0
         self.episode_lengths=[]
         self.average_reward_per_episode=[]
-        self.average_return_per_episode=[]
         self.losses=[]
         self.critic_losses=[]
         self.actor_losses=[]
@@ -326,7 +325,10 @@ class Trainer(BaseTrainer):
         self.B=self.num_envs*self.rollout_len
         self.log_interval=self.global_config.log_interval
         self.next_log_step=self.log_interval
-        self.average_return_per_episode=[]
+        self.episode_count=0.0
+        self.episode_return_sum=0.0
+        self.episode_length_sum=0.0
+        self.seen_episode=False
         if 'eval_interval' in self.global_config:
             self.eval_interval=self.global_config['eval_interval']
             self.next_eval_step=self.eval_interval
@@ -340,39 +342,33 @@ class Trainer(BaseTrainer):
         #measure steps per second
         start_time=time.time()
 
-        (loss,(value_loss,entropy_loss,actor_loss,rewards,diagnostics),infos)=self.agent.step(self.random_key)
+        out=self.agent.step(self.random_key)
+        # everything the agent returns is still on device; pull it in a single
+        # transfer (one host sync per update) instead of a float() per value
+        (loss,(value_loss,entropy_loss,actor_loss,reward_sum,diagnostics),info_stats)=jax.device_get(out)
 
         # NaN detection
-        if jnp.isnan(loss) or jnp.isnan(actor_loss) or jnp.isnan(value_loss):
+        if np.isnan(loss) or np.isnan(actor_loss) or np.isnan(value_loss):
             logger.error(f"NaN detected at step {self.step_count}! "
                         f"loss={loss}, actor_loss={actor_loss}, value_loss={value_loss}")
             raise ValueError(f"NaN loss detected at step {self.step_count}")
 
-        #extract info data across all actors and steps
-
         # increase the step counter
         self.step_count+=(self.B)
 
-        # generic info extraction
-        for step_info in infos:
-            # handle episode statistics from VectorEpisodeStatisticsWrapper
-            if 'episode' in step_info:
-                for ep_info in step_info['episode']:
-                    self.statistic_data.setdefault('reward_per_episode', []).append(ep_info['r'])
-                    self.statistic_data.setdefault('episode_length', []).append(ep_info['l'])
-                    self.average_return_per_episode.append(ep_info['r'])
+        # episode statistics (VectorEpisodeStatisticsWrapper), already reduced
+        # on device to sums over the episodes that finished this rollout
+        info_stats=dict(info_stats)
+        episode=info_stats.pop('episode',None)
+        if episode is not None and episode['count']>0:
+            self.episode_count+=float(episode['count'])
+            self.episode_return_sum+=float(episode['r_sum'])
+            self.episode_length_sum+=float(episode['l_sum'])
+            self.seen_episode=True
 
-            # generic diagnostic logging
-            for key, val in step_info.items():
-                if key in ('episode', 'done', 'termination'):
-                    continue
-                if hasattr(val, 'mean') and hasattr(val, 'shape') and len(val.shape) > 0:
-                    mean_val = float(val.mean())
-                    max_val = float(val.max())
-                    self.statistic_data.setdefault(f'diag_{key}_mean', []).append(mean_val)
-                    self.statistic_data.setdefault(f'diag_{key}_max', []).append(max_val)
-                elif isinstance(val, (int, float)):
-                    self.statistic_data.setdefault(key, []).append(val)
+        # generic diagnostic logging
+        for key, val in info_stats.items():
+            self.statistic_data.setdefault(key, []).append(float(val))
 
         # log the data
         end_time=time.time()
@@ -381,7 +377,7 @@ class Trainer(BaseTrainer):
         self.critic_losses.append(value_loss)
         self.actor_losses.append(actor_loss)
         self.entropy_losses.append(entropy_loss)
-        self.reward_sum+=rewards.sum()
+        self.reward_sum+=reward_sum
 
         # track action distribution diagnostics for continuous control
         if diagnostics['action_std'] is not None:
@@ -411,16 +407,23 @@ class Trainer(BaseTrainer):
             #calculate and log mean of statistic_data
             metrics={}
             for key in self.statistic_data.keys():
-                agg_value=np.mean(self.statistic_data[key])
+                agg_value=np.mean(self.statistic_data[key]) if self.statistic_data[key] else np.nan
                 metrics={**metrics,key:agg_value}
                 self.statistic_data[key]=[]
+            # mean over the episodes finished since the last log
+            return_mean=self.episode_return_sum/self.episode_count if self.episode_count>0 else np.nan
+            if self.seen_episode:
+                metrics['reward_per_episode']=return_mean
+                metrics['episode_length']=self.episode_length_sum/self.episode_count if self.episode_count>0 else np.nan
+            self.episode_count=0.0
+            self.episode_return_sum=0.0
+            self.episode_length_sum=0.0
             self.next_log_step+=self.log_interval
             critic_loss=np.mean(self.critic_losses)
             actor_loss=np.mean(self.actor_losses)
             entropy_loss=np.mean(self.entropy_losses)
             loss=np.mean(self.losses)
             reward_mean=float(self.reward_sum/self.log_interval)
-            return_mean=np.mean(self.average_return_per_episode)
             mean_sps=np.mean(self.sps)
             self.reward_sum=0
             self.critic_losses=[]
@@ -428,7 +431,6 @@ class Trainer(BaseTrainer):
             self.entropy_losses=[]
             self.losses=[]
             self.sps=[]
-            self.average_return_per_episode=[]
 
             # add action distribution diagnostics if available
             if hasattr(self, 'action_stds') and len(self.action_stds) > 0:

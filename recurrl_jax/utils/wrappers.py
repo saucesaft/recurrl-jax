@@ -198,36 +198,59 @@ class MJXGymWrapper(gym.Env):
         pass
 
 
+def _track_episodes(ep_ret, ep_len, rewards, terminated, truncated):
+    ep_ret = ep_ret + rewards
+    ep_len = ep_len + 1
+    dones = jnp.logical_or(terminated, truncated)
+    episode = {'done': dones, 'r': ep_ret, 'l': ep_len}
+    # reset stats for done envs
+    ep_ret = jnp.where(dones, 0.0, ep_ret)
+    ep_len = jnp.where(dones, 0, ep_len)
+    return ep_ret, ep_len, episode
+
+_track_episodes_jit = jax.jit(_track_episodes)
+
 class VectorEpisodeStatisticsWrapper(gym.Wrapper):
+    """tracks per-env episode return/length on device.
+
+    every step adds infos['episode'] = {'done', 'r', 'l'}, each of shape
+    (num_envs,): 'r'/'l' are the running return/length *including* this step,
+    only meaningful where 'done' is set. kept as masked arrays (no host sync)
+    so it can live inside a jitted rollout; the agent reduces them on device.
+    """
     def __init__(self, env):
         super().__init__(env)
         self.num_envs = getattr(env, "num_envs", 1)
         self.episode_returns = jnp.zeros(self.num_envs, dtype=jnp.float32)
         self.episode_lengths = jnp.zeros(self.num_envs, dtype=jnp.int32)
 
+    @property
+    def supports_functional(self):
+        return is_functional_env(self.env)
+
+    @property
+    def functional_state(self):
+        return {'env': self.env.functional_state,
+                'ep_ret': self.episode_returns, 'ep_len': self.episode_lengths}
+
+    @functional_state.setter
+    def functional_state(self, fstate):
+        self.env.functional_state = fstate['env']
+        self.episode_returns = fstate['ep_ret']
+        self.episode_lengths = fstate['ep_len']
+
+    def functional_step(self, fstate, action):
+        env_fstate, obs, rewards, terminated, truncated, infos = self.env.functional_step(fstate['env'], action)
+        ep_ret, ep_len, episode = _track_episodes(fstate['ep_ret'], fstate['ep_len'], rewards, terminated, truncated)
+        new_fstate = {'env': env_fstate, 'ep_ret': ep_ret, 'ep_len': ep_len}
+        return new_fstate, obs, rewards, terminated, truncated, {**infos, 'episode': episode}
+
     def step(self, action):
         obs, rewards, terminated, truncated, infos = self.env.step(action)
-        self.episode_returns += rewards
-        self.episode_lengths += 1
-
-        dones = jnp.logical_or(terminated, truncated)
-
-        dones_np = np.array(dones)
-
-        if np.any(dones_np):
-             for i in range(self.num_envs):
-                if dones_np[i]:
-                    info_item = {
-                        "r": float(self.episode_returns[i]),
-                        "l": int(self.episode_lengths[i])
-                    }
-                    infos.setdefault("episode", []).append(info_item)
-
-        # reset stats for done envs
-        self.episode_returns = jnp.where(dones, 0.0, self.episode_returns)
-        self.episode_lengths = jnp.where(dones, 0, self.episode_lengths)
-
-        return obs, rewards, terminated, truncated, infos
+        self.episode_returns, self.episode_lengths, episode = _track_episodes_jit(
+            self.episode_returns, self.episode_lengths,
+            jnp.asarray(rewards, dtype=jnp.float32), jnp.asarray(terminated), jnp.asarray(truncated))
+        return obs, rewards, terminated, truncated, {**infos, 'episode': episode}
 
     def reset(self, seed=None, options=None):
         return self.env.reset(seed=seed, options=options)

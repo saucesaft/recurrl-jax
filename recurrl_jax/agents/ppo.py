@@ -231,13 +231,79 @@ class PPOAgent(BaseAgent):
                      actor_grad_norm, critic_grad_norm, action_saturation_frac),params, optimizer_state
         self.update_ppo = update_ppo
 
+        self._learn_jit = jax.jit(self._learn)
+        self._train_step_jit = jax.jit(self._train_step)
 
-    def _group_inject_states(self):
+
+    def _group_inject_states(self, optimizer_state=None):
         # self.optimizer is optax.multi_transform({'actor':...,'critic':...,
         # 'shared':...}, ...) so optimizer_state is a PartitionState whose
         # inner_states are each MaskedState(inner_state=(clip_state, inject_state)).
+        if optimizer_state is None:
+            optimizer_state = self.optimizer_state
         return {group: masked_state.inner_state[1]
-                for group, masked_state in self.optimizer_state.inner_states.items()}
+                for group, masked_state in optimizer_state.inner_states.items()}
+
+    def _current_lr(self, optimizer_state):
+        # the rate actually sitting in the optimizer state, or None for an
+        # optimizer without the per-group inject_hyperparams layout
+        try:
+            return next(iter(self._group_inject_states(optimizer_state).values())).hyperparams['learning_rate']
+        except (AttributeError, IndexError, KeyError, TypeError, StopIteration):
+            return None
+
+    def _adapt_lr(self, optimizer_state, approx_kl):
+        # adaptive LR based on KL divergence, applied on device
+        lr = self._current_lr(optimizer_state)
+        new_lr = jnp.where(approx_kl > self.kl_threshold * 2.0, jnp.maximum(lr / 1.5, self.lr_min),
+                 jnp.where(approx_kl < self.kl_threshold * 0.5, jnp.minimum(lr * 1.5, self.lr_max), lr))
+        new_lr = new_lr.astype(jnp.result_type(lr))
+
+        new_inner_states = {}
+        for group, masked_state in optimizer_state.inner_states.items():
+            clip_state, inject_state = masked_state.inner_state
+            new_hyperparams = dict(inject_state.hyperparams)
+            new_hyperparams['learning_rate'] = new_lr
+            new_inject_state = inject_state._replace(hyperparams=new_hyperparams)
+            new_inner_states[group] = masked_state._replace(inner_state=(clip_state, new_inject_state))
+        return optimizer_state._replace(inner_states=new_inner_states)
+
+    def _learn(self, params, optimizer_state, random_key, databatch, update_tick):
+        """pure PPO update on a collected batch + adaptive LR + diagnostics."""
+        (loss, pg_loss, v_loss, entropy_loss, approx_kl, action_std, log_std_mean, action_mean_abs,
+            actor_grad_norm, critic_grad_norm, action_saturation_frac), params, optimizer_state = self.update_ppo(
+                params, optimizer_state, random_key, databatch, update_tick)
+
+        if self.adaptive_lr:
+            optimizer_state = self._adapt_lr(optimizer_state, approx_kl)
+
+        # log the rate actually sitting in the optimizer state -- when
+        # inject_hyperparams was built with a schedule callable, it silently
+        # re-evaluated the schedule from its own step count every update()
+        # and discarded any manual write. This reads back whatever the
+        # optimizer will actually apply next step.
+        diagnostics = {
+            'action_std': action_std,
+            'log_std_mean': log_std_mean,
+            'action_mean_abs': action_mean_abs,
+            'approx_kl': approx_kl,
+            'current_lr': self._current_lr(optimizer_state),
+            'actor_grad_norm': actor_grad_norm,
+            'critic_grad_norm': critic_grad_norm,
+            'action_saturation_frac': action_saturation_frac,
+        }
+        reward_sum = databatch['rewards'].sum()
+        return (loss, (v_loss, entropy_loss, pg_loss, reward_sum, diagnostics)), params, optimizer_state, update_tick + 1
+
+    def _train_step(self, params, optimizer_state, env_fstate, rollout_carry, random_key, update_tick):
+        """one whole PPO iteration -- rollout, GAE, update epochs -- as a
+        single pure function, so it compiles to one XLA program."""
+        unroll_key, update_key = jax.random.split(random_key)
+        env_fstate, rollout_carry, databatch, info_stats = self._scan_rollout(
+            params, env_fstate, rollout_carry, unroll_key)
+        out, params, optimizer_state, update_tick = self._learn(
+            params, optimizer_state, update_key, databatch, update_tick)
+        return out, info_stats, params, optimizer_state, env_fstate, rollout_carry, update_tick
 
     def reset(self,params_key,random_key):
         super(PPOAgent,self).reset(params_key,random_key)
@@ -245,57 +311,27 @@ class PPOAgent(BaseAgent):
         self.update_tick=jnp.array(0)
 
         if self.adaptive_lr:
-            try:
-                inject_states = self._group_inject_states()
-                self.current_lr = float(next(iter(inject_states.values())).hyperparams['learning_rate'])
-            except Exception:
-                self.current_lr = 3e-4
+            lr = self._current_lr(self.optimizer_state)
+            self.current_lr = float(lr) if lr is not None else 3e-4
 
     def step(self,random_key):
-        #unroll actor for rollout_len steps
-        h_tickminus1=jax.tree.map(lambda x: x,self.h_tickminus1)
-        unroll_key,update_key=jax.random.split(random_key)
-        databatch=self.unroll_actors(unroll_key)
-        databatch=vars(databatch)
-        infos=databatch.pop('infos')
-        (loss, pg_loss, v_loss, entropy_loss, approx_kl, action_std, log_std_mean, action_mean_abs,
-            actor_grad_norm, critic_grad_norm, action_saturation_frac),self.params, self.optimizer_state=self.update_ppo(self.params,
-                                self.optimizer_state,update_key,databatch,self.update_tick)
+        if self.functional_env:
+            # fused: one dispatch for the whole iteration, no host sync
+            (out, info_stats, self.params, self.optimizer_state, env_fstate,
+                self.rollout_carry, self.update_tick) = self._train_step_jit(
+                    self.params, self.optimizer_state, self.env.functional_state,
+                    self.rollout_carry, random_key, self.update_tick)
+            self.env.functional_state = env_fstate
+            self.tick += self.rollout_len
+        else:
+            #unroll actor for rollout_len steps
+            unroll_key,update_key=jax.random.split(random_key)
+            databatch=vars(self.unroll_actors(unroll_key))
+            info_stats=databatch.pop('info_stats')
+            out, self.params, self.optimizer_state, self.update_tick = self._learn_jit(
+                self.params, self.optimizer_state, update_key, databatch, self.update_tick)
 
-        # adaptive LR based on KL divergence
+        loss, (v_loss, entropy_loss, pg_loss, reward_sum, diagnostics) = out
         if self.adaptive_lr:
-            kl_val = float(approx_kl)
-            if kl_val > self.kl_threshold * 2.0:
-                self.current_lr = max(self.current_lr / 1.5, self.lr_min)
-            elif kl_val < self.kl_threshold * 0.5:
-                self.current_lr = min(self.current_lr * 1.5, self.lr_max)
-
-            new_inner_states = {}
-            for group, masked_state in self.optimizer_state.inner_states.items():
-                clip_state, inject_state = masked_state.inner_state
-                new_hyperparams = dict(inject_state.hyperparams)
-                new_hyperparams['learning_rate'] = self.current_lr
-                new_inject_state = inject_state._replace(hyperparams=new_hyperparams)
-                new_inner_states[group] = masked_state._replace(inner_state=(clip_state, new_inject_state))
-            self.optimizer_state = self.optimizer_state._replace(inner_states=new_inner_states)
-
-        rewards=databatch['rewards']
-        self.update_tick=self.update_tick+1
-        # log the rate actually sitting in the optimizer state, not
-        # self.current_lr -- when inject_hyperparams was built with a
-        # schedule callable, it silently re-evaluated the schedule from its
-        # own step count every update() and discarded the adaptive rule's
-        # write, so self.current_lr never described the rate in use. This
-        # reads back whatever the optimizer will actually apply next step.
-        actual_lr = float(next(iter(self._group_inject_states().values())).hyperparams['learning_rate'])
-        diagnostics = {
-            'action_std': action_std,
-            'log_std_mean': log_std_mean,
-            'action_mean_abs': action_mean_abs,
-            'approx_kl': approx_kl,
-            'current_lr': actual_lr,
-            'actor_grad_norm': actor_grad_norm,
-            'critic_grad_norm': critic_grad_norm,
-            'action_saturation_frac': action_saturation_frac,
-        }
-        return (loss,(v_loss,entropy_loss,pg_loss,rewards,diagnostics),infos)
+            self.current_lr = diagnostics['current_lr']
+        return (loss,(v_loss,entropy_loss,pg_loss,reward_sum,diagnostics),info_stats)
