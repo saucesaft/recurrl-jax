@@ -63,9 +63,46 @@ class EnvSpec:
     sensor_ids: tuple = ()              # indices into mjx_data.sensordata
 
 
+def _grouped_model_map(step_fn, model_groups, group_sizes, group_batched_fields, data):
+    """Split ``data`` into contiguous groups (sizes ``group_sizes``), step each with
+    its own model from ``model_groups`` (each optionally batched over
+    ``group_batched_fields``), and concatenate results back to full-batch order.
+    ``group_sizes`` is static, so this loop unrolls at trace time."""
+    parts = []
+    start = 0
+    for gi, gsz in enumerate(group_sizes):
+        model = model_groups[gi]
+        dg = jax.tree_util.tree_map(lambda x, s=start, n=gsz: x[s:s + n], data)
+
+        def per_env(idx, dd, model=model):
+            em = model.tree_replace({f: getattr(model, f)[idx] for f in group_batched_fields})
+            return step_fn(em, dd)
+
+        parts.append(jax.vmap(per_env)(jnp.arange(gsz), dg))
+        start += gsz
+    return jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *parts)
+
+
+def _grouped_make_data(model_groups, group_sizes, group_batched_fields):
+    """Fresh mjx data for a batch split into contiguous groups, each using its own
+    model (optionally batched over ``group_batched_fields``), concatenated. Valid
+    only when the group models yield data pytrees of matching shape (same nq/nv/ncon)."""
+    parts = []
+    for gi, gsz in enumerate(group_sizes):
+        model = model_groups[gi]
+
+        def make_one(idx, model=model):
+            em = model.tree_replace({f: getattr(model, f)[idx] for f in group_batched_fields})
+            return mjx.make_data(em)
+
+        parts.append(jax.vmap(make_one)(jnp.arange(gsz)))
+    return jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *parts)
+
+
 @partial(jax.jit, static_argnames=[
     'control_freq_inv', 'use_domain_randomization', 'extra_cache_size',
     'spec', 'dr_params', 'reward_fn', 'termination_fn', 'reset_state_fn', 'extra_state_fn',
+    'group_sizes', 'group_batched_fields',
 ])
 def mjx_training_step(
     actions: jax.Array,
@@ -89,15 +126,29 @@ def mjx_training_step(
     action_scale: float = 1.0,
     extra_cache=None,
     extra_cache_size: int = 0,
+    # multi-model support: when group_sizes is non-empty, the env batch is split
+    # into contiguous groups (sizes given by group_sizes), and each group is stepped
+    # by its own model from model_groups. This lets one batch mix models that differ
+    # in topology/parameters that can't be a vmap axis (e.g. different geom types).
+    # Each group model may itself be batched over group_batched_fields (a leading
+    # per-env axis, e.g. per-env geom_size). mjx_model is unused for physics then.
+    model_groups: tuple = (),
+    group_sizes: tuple = (),
+    group_batched_fields: tuple = (),
 ):
     # 1. apply actions as offsets from default pose
     default_pose = jnp.array(spec.default_pose)
     data_batch = data_batch.replace(ctrl=default_pose + actions * action_scale)
 
-    # 2. physics step — per-env model slice when DR is active
+    # 2. physics step — per-env model slice when DR is active, or per-group model
+    #    when multi-model stepping is active (group_sizes non-empty)
     _batched_fields = get_batched_fields(dr_params) if use_domain_randomization else ()
+    _multi_model = len(group_sizes) > 0
 
     def physics_step(_, data):
+        if _multi_model:
+            return _grouped_model_map(
+                mjx.step, model_groups, group_sizes, group_batched_fields, data)
         if use_domain_randomization:
             def step_one(idx, d):
                 env_model = mjx_model.tree_replace(
@@ -182,6 +233,9 @@ def mjx_training_step(
         extra_cache_size=extra_cache_size,
         spec=spec,
         reset_state_fn=reset_state_fn,
+        model_groups=model_groups,
+        group_sizes=group_sizes,
+        group_batched_fields=group_batched_fields,
     )
 
     def no_reset(k, m, d, mask, ec):
@@ -219,12 +273,18 @@ def _mjx_reset_jit(
     extra_cache_size: int = 0,
     spec: EnvSpec = None,
     reset_state_fn: Callable = None,
+    model_groups: tuple = (),
+    group_sizes: tuple = (),
+    group_batched_fields: tuple = (),
 ):
     """generic reset: fresh data, env-specific state init, DR re-randomize."""
     num_envs = reset_mask.shape[0]
 
-    # create fresh mjx data for each env (using its own model slice if DR)
-    if use_domain_randomization:
+    # create fresh mjx data for each env (using its own model slice if DR, or its
+    # per-group model when multi-model stepping is active)
+    if len(group_sizes) > 0:
+        fresh_data = _grouped_make_data(model_groups, group_sizes, group_batched_fields)
+    elif use_domain_randomization:
         _batched_fields = get_batched_fields(dr_params)
 
         def make_data_slice(idx, model):
@@ -258,3 +318,15 @@ def _mjx_reset_jit(
         mjx_model = re_randomize_on_reset(base_mjx, mjx_model, reset_mask, key, dr_params)
 
     return mjx_model, data_batch
+
+
+# jitted entry point for direct callers (env.reset()). despite its name,
+# _mjx_reset_jit is a plain function: inside mjx_training_step it inlines into
+# the step trace, but a direct call runs it eagerly — and _grouped_make_data's
+# fresh vmap closures then re-trace and re-COMPILE on every reset (i.e. every
+# eval). this wrapper has stable identity, so it compiles once per shape
+# config and hits the persistent cache across processes.
+mjx_reset = partial(jax.jit, static_argnames=[
+    'use_domain_randomization', 'dr_params', 'extra_cache_size', 'spec',
+    'reset_state_fn', 'group_sizes', 'group_batched_fields',
+])(_mjx_reset_jit)

@@ -43,8 +43,8 @@ def record_evaluation_episode(
 
         if agent.is_continuous:
             mean, log_std = act_logits
-            acts_tick = mean.squeeze(axis=1)
-            acts_tick = jnp.clip(acts_tick, -1.0, 1.0)
+            # actor mean is pre-squash; the executed deterministic action is tanh(mean)
+            acts_tick = jnp.tanh(mean.squeeze(axis=1))
         else:
             acts_tick = jnp.argmax(act_logits, axis=-1)
 

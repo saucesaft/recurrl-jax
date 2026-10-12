@@ -14,6 +14,7 @@ from flax.training.train_state import TrainState
 from recurrl_jax.models.actor_critic import *
 from typing import Callable,Tuple
 from recurrl_jax.agents.base_agent import BaseAgent
+from recurrl_jax.utils.distributions import squashed_gaussian
 
 
 
@@ -94,7 +95,7 @@ class PPOAgent(BaseAgent):
                 # clip log_std
                 log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
                 std = jnp.exp(log_std)
-                dist = distrax.MultivariateNormalDiag(mean, std)
+                dist = squashed_gaussian(mean, std)
                 logprobs = dist.log_prob(actions)
             else:
                 B,T=actions.shape
@@ -112,9 +113,12 @@ class PPOAgent(BaseAgent):
                     # clip log_std
                     log_std = jnp.clip(log_std, self.log_std_min, self.log_std_max)
                     std = jnp.exp(log_std)
-                    dist = distrax.MultivariateNormalDiag(mean, std)
+                    dist = squashed_gaussian(mean, std)
                     newlogprobs = dist.log_prob(mb_actions)
-                    entropy = dist.entropy()
+                    # distrax.Transformed has no closed-form entropy (tanh has
+                    # no analytic entropy correction); use the base Gaussian's
+                    # entropy as the exploration-bonus proxy, as before.
+                    entropy = dist.distribution.entropy()
                 else:
                     B,T=mb_actions.shape
                     newlogprobs=jax.nn.log_softmax(logits_new).reshape(B*T,-1)
@@ -189,9 +193,13 @@ class PPOAgent(BaseAgent):
                          mb_returns,
                          mb_h_tickminus1
                      )
+                    # pre-clip grad norms, per group, before the optimizer's
+                    # internal clip_by_global_norm rescales them.
+                    actor_grad_norm = optax.global_norm(grads['params']['actor'])
+                    critic_grad_norm = optax.global_norm(grads['params']['critic'])
                     updates,optimizer_state = self.optimizer.update(grads, optimizer_state, params)
                     params = optax.apply_updates(params, updates)
-                    return (params,optimizer_state,model_key),(loss, pg_loss, v_loss, entropy_loss, approx_kl)
+                    return (params,optimizer_state,model_key),(loss, pg_loss, v_loss, entropy_loss, approx_kl, actor_grad_norm, critic_grad_norm)
 
                 (params,optimizer_state,model_key),losses=jax.lax.scan(minibatch_update,(params,optimizer_state,model_key),batch_inds)
                 losses=jax.tree.map(lambda x:x.mean(),losses)
@@ -200,7 +208,11 @@ class PPOAgent(BaseAgent):
 
             (params,optimizer_state,random_key),losses=jax.lax.scan(update_epoch,(params,optimizer_state,random_key),jnp.arange(self.update_epochs))
             losses=jax.tree.map(lambda x:x.mean(),losses)
-            loss, pg_loss, v_loss, entropy_loss, approx_kl=losses
+            loss, pg_loss, v_loss, entropy_loss, approx_kl, actor_grad_norm, critic_grad_norm=losses
+
+            # fraction of *executed* actions sitting near the tanh saturation
+            # bound, over the whole rollout just collected.
+            action_saturation_frac = (jnp.abs(actions) > 0.95).mean()
 
             if self.is_continuous:
                 mean, log_std = actor_preds
@@ -215,9 +227,17 @@ class PPOAgent(BaseAgent):
                 log_std_mean = None
                 action_mean_abs = None
 
-            return (loss, pg_loss, v_loss, entropy_loss, approx_kl, action_std, log_std_mean, action_mean_abs),params, optimizer_state
+            return (loss, pg_loss, v_loss, entropy_loss, approx_kl, action_std, log_std_mean, action_mean_abs,
+                     actor_grad_norm, critic_grad_norm, action_saturation_frac),params, optimizer_state
         self.update_ppo = update_ppo
 
+
+    def _group_inject_states(self):
+        # self.optimizer is optax.multi_transform({'actor':...,'critic':...,
+        # 'shared':...}, ...) so optimizer_state is a PartitionState whose
+        # inner_states are each MaskedState(inner_state=(clip_state, inject_state)).
+        return {group: masked_state.inner_state[1]
+                for group, masked_state in self.optimizer_state.inner_states.items()}
 
     def reset(self,params_key,random_key):
         super(PPOAgent,self).reset(params_key,random_key)
@@ -226,8 +246,9 @@ class PPOAgent(BaseAgent):
 
         if self.adaptive_lr:
             try:
-                self.current_lr = float(self.optimizer_state[1].hyperparams['learning_rate'])
-            except:
+                inject_states = self._group_inject_states()
+                self.current_lr = float(next(iter(inject_states.values())).hyperparams['learning_rate'])
+            except Exception:
                 self.current_lr = 3e-4
 
     def step(self,random_key):
@@ -237,7 +258,8 @@ class PPOAgent(BaseAgent):
         databatch=self.unroll_actors(unroll_key)
         databatch=vars(databatch)
         infos=databatch.pop('infos')
-        (loss, pg_loss, v_loss, entropy_loss, approx_kl, action_std, log_std_mean, action_mean_abs),self.params, self.optimizer_state=self.update_ppo(self.params,
+        (loss, pg_loss, v_loss, entropy_loss, approx_kl, action_std, log_std_mean, action_mean_abs,
+            actor_grad_norm, critic_grad_norm, action_saturation_frac),self.params, self.optimizer_state=self.update_ppo(self.params,
                                 self.optimizer_state,update_key,databatch,self.update_tick)
 
         # adaptive LR based on KL divergence
@@ -248,19 +270,32 @@ class PPOAgent(BaseAgent):
             elif kl_val < self.kl_threshold * 0.5:
                 self.current_lr = min(self.current_lr * 1.5, self.lr_max)
 
-            clip_state, inject_state = self.optimizer_state
-            new_hyperparams = inject_state.hyperparams.copy()
-            new_hyperparams['learning_rate'] = self.current_lr
-            new_inject_state = inject_state._replace(hyperparams=new_hyperparams)
-            self.optimizer_state = (clip_state, new_inject_state)
+            new_inner_states = {}
+            for group, masked_state in self.optimizer_state.inner_states.items():
+                clip_state, inject_state = masked_state.inner_state
+                new_hyperparams = dict(inject_state.hyperparams)
+                new_hyperparams['learning_rate'] = self.current_lr
+                new_inject_state = inject_state._replace(hyperparams=new_hyperparams)
+                new_inner_states[group] = masked_state._replace(inner_state=(clip_state, new_inject_state))
+            self.optimizer_state = self.optimizer_state._replace(inner_states=new_inner_states)
 
         rewards=databatch['rewards']
         self.update_tick=self.update_tick+1
+        # log the rate actually sitting in the optimizer state, not
+        # self.current_lr -- when inject_hyperparams was built with a
+        # schedule callable, it silently re-evaluated the schedule from its
+        # own step count every update() and discarded the adaptive rule's
+        # write, so self.current_lr never described the rate in use. This
+        # reads back whatever the optimizer will actually apply next step.
+        actual_lr = float(next(iter(self._group_inject_states().values())).hyperparams['learning_rate'])
         diagnostics = {
             'action_std': action_std,
             'log_std_mean': log_std_mean,
             'action_mean_abs': action_mean_abs,
             'approx_kl': approx_kl,
-            'current_lr': self.current_lr if self.adaptive_lr else None
+            'current_lr': actual_lr,
+            'actor_grad_norm': actor_grad_norm,
+            'critic_grad_norm': critic_grad_norm,
+            'action_saturation_frac': action_saturation_frac,
         }
         return (loss,(v_loss,entropy_loss,pg_loss,rewards,diagnostics),infos)

@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import optax
+import flax.traverse_util as ftu
 import pandas as pd
 import rlax
 import wandb
@@ -33,6 +34,21 @@ logging.getLogger('absl').setLevel(logging.ERROR)
 logging.getLogger('orbax').setLevel(logging.ERROR)
 
 
+def _param_group_labels(params):
+    """label every leaf 'actor', 'critic', or 'shared' (repr_model/seq_model,
+    which both heads backprop through) so the optimizer can clip each
+    group's gradient norm independently -- otherwise a single global clip
+    lets whichever loss term has the largest raw gradient (typically the
+    critic, given vf_coef and an unnormalized value scale) rescale
+    everyone else's update by the same factor, starving the actor."""
+    flat = ftu.flatten_dict(params)
+    labels = {}
+    for path in flat:
+        top = path[1] if path and path[0] == 'params' and len(path) > 1 else (path[0] if path else 'shared')
+        labels[path] = top if top in ('actor', 'critic') else 'shared'
+    return ftu.unflatten_dict(labels)
+
+
 class Trainer(BaseTrainer):
     """generalized trainer using env_factory pattern"""
 
@@ -62,6 +78,26 @@ class Trainer(BaseTrainer):
                 options=options
             )
             logger.info(f"Checkpoint manager initialized at {checkpoint_path}")
+
+        # periodic checkpoint, independent of save_best_only/eval -- a
+        # save_best_only run can go arbitrarily long without a new "best"
+        # checkpoint if eval return plateaus while training keeps moving,
+        # silently leaving the on-disk checkpoint stale relative to the
+        # live policy. this is a safety net, kept in a separate directory
+        # so it never competes with the best-checkpoint manager's
+        # max_to_keep=1 eviction.
+        self.checkpoint_interval = self.global_config.get('checkpoint_interval', None)
+        self.periodic_checkpoint_manager = None
+        if self.checkpoint_dir and self.checkpoint_interval:
+            self.next_checkpoint_step = self.checkpoint_interval
+            periodic_path = Path(self.checkpoint_dir).resolve().parent / (Path(self.checkpoint_dir).name + '_periodic')
+            periodic_path.mkdir(parents=True, exist_ok=True)
+            self.periodic_checkpoint_manager = CheckpointManager(
+                periodic_path,
+                PyTreeCheckpointer(),
+                options=CheckpointManagerOptions(max_to_keep=3, create=True)
+            )
+            logger.info(f"Periodic checkpoint manager initialized at {periodic_path} (every {self.checkpoint_interval} steps)")
 
         # video rendering setup
         self.video_dir = self.global_config.get('video_dir', None)
@@ -119,6 +155,7 @@ class Trainer(BaseTrainer):
                 action_dim = train_envs.action_space.shape[0]
                 actor_fn = actor_model_continuous(
                     self.trainer_config['d_actor'], action_dim,
+                    initial_log_std=self.trainer_config.get('initial_log_std', -0.5),
                     log_std_min=self.trainer_config.get('log_std_min', -5.0),
                     log_std_max=self.trainer_config.get('log_std_max', 2.0)
                 )
@@ -185,18 +222,22 @@ class Trainer(BaseTrainer):
 
             if self.trainer_config['ent_coef']['final'] is None:
                 self.trainer_config['ent_coef']['final']=self.trainer_config['ent_coef']['initial']
-            lr_schedule=optax.polynomial_schedule(learning_rate['initial'],learning_rate['final'],learning_rate.get('power', 1),learning_rate.get('max_decay_steps', self.global_config.steps))
-            ent_schedule=optax.polynomial_schedule(self.trainer_config['ent_coef']['initial'],self.trainer_config['ent_coef']['final'],
-                                                   self.trainer_config['ent_coef']['power'],self.trainer_config['ent_coef']['max_decay_steps'])
 
-            self.optimizer=optax.chain(
-                                optax.clip_by_global_norm(self.trainer_config['max_grad_norm']),
-                                optax.inject_hyperparams(optax.adamw)(
-                                    learning_rate=lr_schedule,
-                                    **optimizer_config
-                                ),
-                            )
-            # adaptive LR config
+            # lr_schedule/ent_schedule are indexed by update_tick (one tick per
+            # PPO update, i.e. per rollout of batch_size=num_envs*rollout_len
+            # env-steps -- see ppo.py), but max_decay_steps is written in
+            # config in raw env-step units (matching global_config.steps).
+            # Convert here so a run that lasts num_updates ticks actually
+            # reaches the end of the decay curve instead of the schedule
+            # barely moving off its initial value.
+            lr_max_decay_steps = max(1, learning_rate.get('max_decay_steps', self.global_config.steps) // batch_size)
+            ent_max_decay_steps = max(1, self.trainer_config['ent_coef']['max_decay_steps'] // batch_size)
+            lr_schedule=optax.polynomial_schedule(learning_rate['initial'],learning_rate['final'],learning_rate.get('power', 1),lr_max_decay_steps)
+            ent_schedule=optax.polynomial_schedule(self.trainer_config['ent_coef']['initial'],self.trainer_config['ent_coef']['final'],
+                                                   self.trainer_config['ent_coef']['power'],ent_max_decay_steps)
+
+            # adaptive LR config -- parsed before the optimizer is built,
+            # since it decides what we hand to inject_hyperparams below.
             adaptive_lr_config = self.trainer_config.get('adaptive_lr', {})
             if isinstance(adaptive_lr_config, bool):
                 adaptive_lr_enabled = adaptive_lr_config
@@ -208,6 +249,39 @@ class Trainer(BaseTrainer):
                 kl_threshold = adaptive_lr_config.get('kl_threshold', 0.02)
                 lr_min = adaptive_lr_config.get('lr_min', 1e-6)
                 lr_max = adaptive_lr_config.get('lr_max', 1e-2)
+
+            # clip actor/critic/shared-trunk grad norms separately (instead
+            # of one global clip over all params) so the critic's much
+            # larger raw gradient (unnormalized value scale, vf_coef) can't
+            # rescale the actor's update by the same factor and starve it.
+            group_clip_norm = self.trainer_config.get('max_grad_norm', 1.0)
+            # optax.inject_hyperparams re-evaluates a *callable* hyperparam
+            # from its own internal step count on every update() call, which
+            # clobbers any manual write into state.hyperparams before the
+            # inner update runs. That silently discarded every write the
+            # adaptive-LR rule made in ppo.py -- the logged current_lr was
+            # never the rate actually used; the schedule ran unmodified the
+            # whole time. Confirmed directly: after manually overwriting
+            # hyperparams['learning_rate'] and calling update() once more,
+            # the read-back value was the schedule's, not the override.
+            # Handing inject_hyperparams a plain float instead of the
+            # schedule callable makes it treat learning_rate as a normal,
+            # externally-settable hyperparameter, so the adaptive rule's
+            # write actually lands. Only do this when adaptive_lr is
+            # enabled -- otherwise the schedule alone should still drive it.
+            inject_lr = float(learning_rate['initial']) if adaptive_lr_enabled else lr_schedule
+            def _make_group_optimizer():
+                return optax.chain(
+                    optax.clip_by_global_norm(group_clip_norm),
+                    optax.inject_hyperparams(optax.adamw)(
+                        learning_rate=inject_lr,
+                        **optimizer_config
+                    ),
+                )
+            self.optimizer=optax.multi_transform(
+                {'actor': _make_group_optimizer(), 'critic': _make_group_optimizer(), 'shared': _make_group_optimizer()},
+                _param_group_labels,
+            )
 
             # TODO prettier way to pass parameters?
             self.agent=PPOAgent(train_envs=train_envs,eval_env=eval_env,optimizer=self.optimizer, repr_model_fn=repr_fn,
@@ -318,6 +392,21 @@ class Trainer(BaseTrainer):
             self.action_stds.append(float(diagnostics['action_std']))
             self.log_std_means.append(float(diagnostics['log_std_mean']))
             self.action_mean_abs_vals.append(float(diagnostics['action_mean_abs']))
+
+        # PPO optimization diagnostics: computed every step, previously
+        # discarded here without ever reaching the logs.
+        if not hasattr(self, 'approx_kls'):
+            self.approx_kls = []
+            self.actor_grad_norms = []
+            self.critic_grad_norms = []
+            self.action_saturation_fracs = []
+            self.current_lrs = []
+        self.approx_kls.append(float(diagnostics['approx_kl']))
+        self.actor_grad_norms.append(float(diagnostics['actor_grad_norm']))
+        self.critic_grad_norms.append(float(diagnostics['critic_grad_norm']))
+        self.action_saturation_fracs.append(float(diagnostics['action_saturation_frac']))
+        if diagnostics.get('current_lr') is not None:
+            self.current_lrs.append(float(diagnostics['current_lr']))
         if self.step_count>=self.next_log_step:
             #calculate and log mean of statistic_data
             metrics={}
@@ -353,8 +442,18 @@ class Trainer(BaseTrainer):
             metrics={'step':self.step_count,'sps':mean_sps,'loss':loss,'critic_loss':critic_loss,
                                     'actor_loss':actor_loss,'entropy_loss':entropy_loss,'mean_reward':reward_mean,
                                     'return_per_episode':return_mean,
+                                    'approx_kl':np.mean(self.approx_kls),
+                                    'actor_grad_norm':np.mean(self.actor_grad_norms),
+                                    'critic_grad_norm':np.mean(self.critic_grad_norms),
+                                    'action_saturation_frac':np.mean(self.action_saturation_fracs),
+                                    **({'current_lr':np.mean(self.current_lrs)} if self.current_lrs else {}),
                                     **metrics
                                     }
+            self.approx_kls=[]
+            self.actor_grad_norms=[]
+            self.critic_grad_norms=[]
+            self.action_saturation_fracs=[]
+            self.current_lrs=[]
             self.result_data.append(metrics)
         else:
             metrics=None
@@ -379,6 +478,22 @@ class Trainer(BaseTrainer):
                     self.random_key,
                     self.global_config['eval_episodes']
                 )
+                det_success_rate = getattr(self.agent, 'last_eval_success_rate', None)
+
+                # sampled-action eval, logged under its own keys: if the
+                # policy leans on its own action noise to stay upright, the
+                # stochastic rollout survives longer than the deterministic
+                # (mean) one -- a real signal, not visible from the
+                # deterministic number alone.
+                self.agent.eval_stochastic = True
+                stoch_avg_episode_len, stoch_avg_episode_return, _ = self.agent.evaluate(
+                    self.random_key,
+                    self.global_config['eval_episodes']
+                )
+                self.agent.eval_stochastic = False
+                stoch_success_rate = getattr(self.agent, 'last_eval_success_rate', None)
+                if det_success_rate is not None:
+                    self.agent.last_eval_success_rate = det_success_rate
 
                 if len(rollouts) > 0:
                     rollouts = np.concatenate(rollouts, axis=0)
@@ -398,37 +513,54 @@ class Trainer(BaseTrainer):
             metrics['eval_avg_episode_return'] = float(avg_episode_return)
             if hasattr(self.agent, 'last_eval_success_rate'):
                 metrics['eval_success_rate'] = float(self.agent.last_eval_success_rate)
+            if not (self.render_videos and self.video_config and self.video_render_fn is not None):
+                metrics['eval_stochastic_avg_episode_len'] = float(stoch_avg_episode_len)
+                metrics['eval_stochastic_avg_episode_return'] = float(stoch_avg_episode_return)
+                if stoch_success_rate is not None:
+                    metrics['eval_stochastic_success_rate'] = float(stoch_success_rate)
 
-            # save checkpoint if best model
-            if self.checkpoint_manager and avg_episode_return > self.best_eval_return:
-                self.best_eval_return = avg_episode_return
-
-                checkpoint_state = {
-                    'params': self.agent.params,
-                    'optimizer_state': self.agent.optimizer_state,
-                    'update_tick': np.array(self.agent.update_tick),
-                    'step_count': self.step_count,
-                    'best_eval_return': float(self.best_eval_return),
-                }
-
-                # save obs normalisation stats if available
-                rms_env = getattr(self.agent, 'eval_env', None)
-                if rms_env is None:
-                    rms_env = getattr(self.agent, 'train_envs', None)
-                # unwrap one level (SqueezeWrapper / VectorEpisodeStatisticsWrapper)
-                if rms_env is not None and not hasattr(rms_env, 'running_mean_std'):
-                    rms_env = getattr(rms_env, 'env', rms_env)
-                rms = getattr(rms_env, 'running_mean_std', None)
-                if rms is not None:
-                    checkpoint_state['obs_mean'] = np.array(rms.mean)
-                    checkpoint_state['obs_var'] = np.array(rms.var)
-
+            # save checkpoint: best-by-eval-return by default; save_best_only=false
+            # saves at EVERY eval (max_to_keep=1 -> latest survives), so the final
+            # policy is never silently discarded when eval peaks early.
+            save_best_only = bool(self.global_config.get('save_best_only', True))
+            is_best = avg_episode_return > self.best_eval_return
+            if self.checkpoint_manager and (is_best or not save_best_only):
+                self.best_eval_return = max(self.best_eval_return, float(avg_episode_return))
+                checkpoint_state = self._build_checkpoint_state()
                 self.checkpoint_manager.save(self.step_count, checkpoint_state)
                 logger.info(f"Saved best checkpoint at step {self.step_count} "
                             f"with eval return {self.best_eval_return:.2f}")
                 metrics['checkpoint_saved'] = True
 
+        if self.periodic_checkpoint_manager is not None and self.step_count>=self.next_checkpoint_step:
+            self.next_checkpoint_step+=self.checkpoint_interval
+            self.periodic_checkpoint_manager.save(self.step_count, self._build_checkpoint_state())
+            logger.info(f"Saved periodic checkpoint at step {self.step_count}")
+            if metrics is not None:
+                metrics['periodic_checkpoint_saved'] = True
+
         return loss,metrics,self.step_count
+
+    def _build_checkpoint_state(self):
+        checkpoint_state = {
+            'params': self.agent.params,
+            'optimizer_state': self.agent.optimizer_state,
+            'update_tick': np.array(self.agent.update_tick),
+            'step_count': self.step_count,
+            'best_eval_return': float(self.best_eval_return),
+        }
+        # save obs normalisation stats if available
+        rms_env = getattr(self.agent, 'eval_env', None)
+        if rms_env is None:
+            rms_env = getattr(self.agent, 'train_envs', None)
+        # unwrap one level (SqueezeWrapper / VectorEpisodeStatisticsWrapper)
+        if rms_env is not None and not hasattr(rms_env, 'running_mean_std'):
+            rms_env = getattr(rms_env, 'env', rms_env)
+        rms = getattr(rms_env, 'running_mean_std', None)
+        if rms is not None:
+            checkpoint_state['obs_mean'] = np.array(rms.mean)
+            checkpoint_state['obs_var'] = np.array(rms.var)
+        return checkpoint_state
 
 
     def get_summary_table(self):

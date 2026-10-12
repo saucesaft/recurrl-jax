@@ -22,8 +22,8 @@ A JAX-based recurrent reinforcement learning library. Supports LSTM, GRU, and GT
 Dexterous in-hand reorientation with a 16-DOF LEAP hand in MJX.
 
 ```bash
-cd examples/leap_hand
-uv run python train.py
+# from the repository root
+uv run python -m examples.leap_hand.train
 ```
 
 ### ANYmal locomotion
@@ -31,8 +31,8 @@ uv run python train.py
 Quadrupedal locomotion for the ANYmal C robot.
 
 ```bash
-cd examples/anymal
-uv run python train.py
+# from the repository root
+uv run python -m examples.anymal.train
 ```
 
 ### pendulum
@@ -40,8 +40,8 @@ uv run python train.py
 Classic swing-up task.
 
 ```bash
-cd examples/pendulum
-uv run python train.py
+# from the repository root
+uv run python -m examples.pendulum.train
 ```
 
 Config lives in `examples/leap_hand/config/`.
